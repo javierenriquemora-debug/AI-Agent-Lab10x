@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createServerClient } from "@agents/db";
 import { runAgent } from "@agents/agent";
+import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 
 export async function POST(request: Request) {
   try {
@@ -17,23 +18,7 @@ export async function POST(request: Request) {
     }
 
     const db = createServerClient();
-
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("agent_system_prompt, agent_name")
-      .eq("id", user.id)
-      .single();
-
-    const { data: toolSettings } = await supabase
-      .from("user_tool_settings")
-      .select("*")
-      .eq("user_id", user.id);
-
-    const { data: integrations } = await supabase
-      .from("user_integrations")
-      .select("*")
-      .eq("user_id", user.id)
-      .eq("status", "active");
+    const runtime = await loadAgentRuntimeContext(db, user.id);
 
     let session = await supabase
       .from("agent_sessions")
@@ -69,32 +54,16 @@ export async function POST(request: Request) {
       message,
       userId: user.id,
       sessionId: session.id,
-      systemPrompt: (profile?.agent_system_prompt as string) ?? "Eres un asistente útil.",
+      systemPrompt: runtime.systemPrompt,
       db,
-      enabledTools: (toolSettings ?? []).map((t: Record<string, unknown>) => ({
-        id: t.id as string,
-        user_id: t.user_id as string,
-        tool_id: t.tool_id as string,
-        enabled: t.enabled as boolean,
-        config_json: (t.config_json as Record<string, unknown>) ?? {},
-      })),
-      integrations: (integrations ?? []).map((i: Record<string, unknown>) => ({
-        id: i.id as string,
-        user_id: i.user_id as string,
-        provider: i.provider as string,
-        scopes: (i.scopes as string[]) ?? [],
-        status: i.status as "active" | "revoked" | "expired",
-        created_at: i.created_at as string,
-      })),
+      enabledTools: runtime.enabledTools,
+      integrations: runtime.integrations,
+      integrationSecrets: runtime.integrationSecrets,
     });
 
-    const pendingConfirmation = result.response.includes("pending_confirmation")
-      ? JSON.parse(result.response)
-      : null;
-
     return NextResponse.json({
-      response: pendingConfirmation ? null : result.response,
-      pendingConfirmation,
+      response: result.response,
+      pendingConfirmation: result.pendingConfirmation,
       toolCalls: result.toolCalls,
     });
   } catch (error) {

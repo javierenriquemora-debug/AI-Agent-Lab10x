@@ -2,21 +2,68 @@
 
 import { useState, useRef, useEffect } from "react";
 
+interface PendingConfirmation {
+  toolCallId: string;
+  toolName: string;
+  message: string;
+}
+
 interface Message {
   role: string;
   content: string;
   created_at?: string;
+  pendingConfirmation?: PendingConfirmation | null;
 }
 
 interface Props {
   agentName: string;
-  initialMessages: Message[];
+  initialMessages: Array<{
+    role: string;
+    content: string;
+    created_at?: string;
+    structured_payload?: Record<string, unknown> | null;
+    tool_call_id?: string | null;
+  }>;
+  pendingToolCallIds: string[];
 }
 
-export function ChatInterface({ agentName, initialMessages }: Props) {
-  const [messages, setMessages] = useState<Message[]>(initialMessages);
+function getPendingConfirmation(
+  structuredPayload: Record<string, unknown> | null | undefined,
+  pendingToolCallIds: Set<string>
+): PendingConfirmation | null {
+  if (structuredPayload?.type !== "pending_confirmation") {
+    return null;
+  }
+
+  const toolCallId =
+    typeof structuredPayload.toolCallId === "string" ? structuredPayload.toolCallId : null;
+  const message =
+    typeof structuredPayload.message === "string" ? structuredPayload.message : null;
+
+  if (!toolCallId || !message || !pendingToolCallIds.has(toolCallId)) {
+    return null;
+  }
+
+  return {
+    toolCallId,
+    toolName: typeof structuredPayload.toolName === "string" ? structuredPayload.toolName : "",
+    message,
+  };
+}
+
+export function ChatInterface({ agentName, initialMessages, pendingToolCallIds }: Props) {
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const pendingIds = new Set(pendingToolCallIds);
+    return initialMessages.map((message) => ({
+      role: message.role,
+      content: message.content,
+      created_at: message.created_at,
+      pendingConfirmation: getPendingConfirmation(message.structured_payload, pendingIds),
+    }));
+  });
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [confirmingToolCallId, setConfirmingToolCallId] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -54,7 +101,8 @@ export function ChatInterface({ agentName, initialMessages }: Props) {
           ...prev,
           {
             role: "assistant",
-            content: `Se requiere confirmación: ${data.pendingConfirmation.message}\n\n¿Deseas proceder?`,
+            content: data.pendingConfirmation.message,
+            pendingConfirmation: data.pendingConfirmation,
           },
         ]);
       }
@@ -65,6 +113,49 @@ export function ChatInterface({ agentName, initialMessages }: Props) {
       ]);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleToolConfirmation(
+    messageIndex: number,
+    toolCallId: string,
+    action: "approve" | "reject"
+  ) {
+    setConfirmingToolCallId(toolCallId);
+
+    try {
+      const response = await fetch(`/api/tool-calls/${toolCallId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "No se pudo procesar la acción.");
+      }
+
+      setMessages((prev) => {
+        const next = [...prev];
+        next[messageIndex] = {
+          ...next[messageIndex],
+          pendingConfirmation: null,
+        };
+        return [...next, { role: "assistant", content: data.message }];
+      });
+    } catch (error) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            error instanceof Error
+              ? error.message
+              : "No se pudo procesar la acción. Intenta de nuevo.",
+        },
+      ]);
+    } finally {
+      setConfirmingToolCallId(null);
     }
   }
 
@@ -81,22 +172,48 @@ export function ChatInterface({ agentName, initialMessages }: Props) {
               <p className="mt-1">Escribe un mensaje para comenzar.</p>
             </div>
           )}
-          {messages.map((msg, i) => (
-            <div
-              key={i}
-              className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-            >
+          {messages.map((msg, i) => {
+            const pendingConfirmation = msg.pendingConfirmation;
+
+            return (
               <div
-                className={`max-w-[80%] rounded-lg px-4 py-2.5 text-sm leading-relaxed ${
-                  msg.role === "user"
-                    ? "bg-blue-600 text-white"
-                    : "bg-neutral-100 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100"
-                }`}
+                key={i}
+                className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
               >
-                <p className="whitespace-pre-wrap">{msg.content}</p>
+                <div
+                  className={`max-w-[80%] rounded-lg px-4 py-2.5 text-sm leading-relaxed ${
+                    msg.role === "user"
+                      ? "bg-blue-600 text-white"
+                      : "bg-neutral-100 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100"
+                  }`}
+                >
+                  <p className="whitespace-pre-wrap">{msg.content}</p>
+                  {pendingConfirmation && (
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        onClick={() =>
+                          handleToolConfirmation(i, pendingConfirmation.toolCallId, "approve")
+                        }
+                        disabled={confirmingToolCallId === pendingConfirmation.toolCallId}
+                        className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        Aprobar
+                      </button>
+                      <button
+                        onClick={() =>
+                          handleToolConfirmation(i, pendingConfirmation.toolCallId, "reject")
+                        }
+                        disabled={confirmingToolCallId === pendingConfirmation.toolCallId}
+                        className="rounded-md border border-neutral-300 px-3 py-1.5 text-xs font-medium hover:bg-neutral-50 disabled:opacity-50 dark:border-neutral-600 dark:hover:bg-neutral-700"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           {loading && (
             <div className="flex justify-start">
               <div className="rounded-lg bg-neutral-100 px-4 py-2.5 text-sm dark:bg-neutral-800">

@@ -8,7 +8,12 @@ import {
 import type { DbClient } from "@agents/db";
 import type { UserToolSetting, UserIntegration } from "@agents/types";
 import { createChatModel } from "./model";
-import { buildLangChainTools } from "./tools/adapters";
+import {
+  buildLangChainTools,
+  getPendingConfirmationFromToolResult,
+  type IntegrationSecrets,
+  type PendingConfirmation,
+} from "./tools/adapters";
 import { getSessionMessages, addMessage } from "@agents/db";
 
 const GraphState = Annotation.Root({
@@ -19,6 +24,10 @@ const GraphState = Annotation.Root({
   sessionId: Annotation<string>(),
   userId: Annotation<string>(),
   systemPrompt: Annotation<string>(),
+  pendingConfirmation: Annotation<PendingConfirmation | null>({
+    reducer: (_prev, next) => next,
+    default: () => null,
+  }),
 });
 
 export interface AgentInput {
@@ -29,17 +38,28 @@ export interface AgentInput {
   db: DbClient;
   enabledTools: UserToolSetting[];
   integrations: UserIntegration[];
+  integrationSecrets?: IntegrationSecrets;
 }
 
 export interface AgentOutput {
-  response: string;
+  response: string | null;
   toolCalls: string[];
+  pendingConfirmation: PendingConfirmation | null;
 }
 
 const MAX_TOOL_ITERATIONS = 6;
 
 export async function runAgent(input: AgentInput): Promise<AgentOutput> {
-  const { message, userId, sessionId, systemPrompt, db, enabledTools, integrations } = input;
+  const {
+    message,
+    userId,
+    sessionId,
+    systemPrompt,
+    db,
+    enabledTools,
+    integrations,
+    integrationSecrets,
+  } = input;
 
   const model = createChatModel();
   const lcTools = buildLangChainTools({
@@ -48,6 +68,7 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     sessionId,
     enabledTools,
     integrations,
+    integrationSecrets,
   });
 
   const modelWithTools = lcTools.length > 0 ? model.bindTools(lcTools) : model;
@@ -86,6 +107,10 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
       if (matchingTool) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const result = await (matchingTool as any).invoke(tc.args);
+        const pendingConfirmation = getPendingConfirmationFromToolResult(result);
+        if (pendingConfirmation) {
+          return { pendingConfirmation };
+        }
         results.push(new ToolMessage({ content: String(result), tool_call_id: tc.id! }));
       }
     }
@@ -112,7 +137,12 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
       tools: "tools",
       end: "__end__",
     })
-    .addEdge("tools", "agent");
+    .addConditionalEdges("tools", (state) => {
+      return state.pendingConfirmation ? "end" : "agent";
+    }, {
+      end: "__end__",
+      agent: "agent",
+    });
 
   const checkpointer = new MemorySaver();
   const app = graph.compile({ checkpointer });
@@ -124,9 +154,25 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
   ];
 
   const finalState = await app.invoke(
-    { messages: initialMessages, sessionId, userId, systemPrompt },
+    { messages: initialMessages, sessionId, userId, systemPrompt, pendingConfirmation: null },
     { configurable: { thread_id: sessionId } }
   );
+
+  if (finalState.pendingConfirmation) {
+    await addMessage(db, sessionId, "assistant", finalState.pendingConfirmation.message, {
+      tool_call_id: finalState.pendingConfirmation.toolCallId,
+      structured_payload: {
+        type: "pending_confirmation",
+        ...finalState.pendingConfirmation,
+      },
+    });
+
+    return {
+      response: null,
+      toolCalls: toolCallNames,
+      pendingConfirmation: finalState.pendingConfirmation,
+    };
+  }
 
   const lastMessage = finalState.messages[finalState.messages.length - 1];
   const responseText =
@@ -136,5 +182,5 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
 
   await addMessage(db, sessionId, "assistant", responseText);
 
-  return { response: responseText, toolCalls: toolCallNames };
+  return { response: responseText, toolCalls: toolCallNames, pendingConfirmation: null };
 }

@@ -50,3 +50,37 @@ export async function getPendingToolCall(db: DbClient, toolCallId: string) {
     .single();
   return data as ToolCall | null;
 }
+
+export async function getToolCallById(db: DbClient, toolCallId: string) {
+  const { data, error } = await db
+    .from("tool_calls")
+    .select("*")
+    .eq("id", toolCallId)
+    .maybeSingle();
+  if (error) throw error;
+  return data as ToolCall | null;
+}
+
+export async function approveToolCall(db: DbClient, toolCallId: string) {
+  const { data, error } = await db
+    .from("tool_calls")
+    .update({ status: "approved" })
+    .eq("id", toolCallId)
+    .eq("status", "pending_confirmation")
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data as ToolCall | null;
+}
+
+export async function rejectToolCall(db: DbClient, toolCallId: string) {
+  const { data, error } = await db
+    .from("tool_calls")
+    .update({ status: "rejected", finished_at: new Date().toISOString() })
+    .eq("id", toolCallId)
+    .eq("status", "pending_confirmation")
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data as ToolCall | null;
+}

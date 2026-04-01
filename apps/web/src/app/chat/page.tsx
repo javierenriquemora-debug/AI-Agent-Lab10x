@@ -25,15 +25,29 @@ export default async function ChatPage() {
     .limit(1)
     .single();
 
-  let sessionMessages: Array<{ role: string; content: string; created_at: string }> = [];
+  let sessionMessages: Array<{
+    role: string;
+    content: string;
+    created_at: string;
+    structured_payload?: Record<string, unknown> | null;
+    tool_call_id?: string | null;
+  }> = [];
+  let pendingToolCallIds: string[] = [];
   if (messages?.id) {
     const { data } = await supabase
       .from("agent_messages")
-      .select("role, content, created_at")
+      .select("role, content, created_at, structured_payload, tool_call_id")
       .eq("session_id", messages.id)
       .order("created_at", { ascending: true })
       .limit(50);
     sessionMessages = data ?? [];
+
+    const { data: pendingToolCalls } = await supabase
+      .from("tool_calls")
+      .select("id")
+      .eq("session_id", messages.id)
+      .eq("status", "pending_confirmation");
+    pendingToolCallIds = (pendingToolCalls ?? []).map((call) => call.id as string);
   }
 
   return (
@@ -68,6 +82,7 @@ export default async function ChatPage() {
       <ChatInterface
         agentName={profile.agent_name as string}
         initialMessages={sessionMessages}
+        pendingToolCallIds={pendingToolCallIds}
       />
     </div>
   );

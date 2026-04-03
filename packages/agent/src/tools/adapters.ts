@@ -11,6 +11,13 @@ import {
   listGithubRepos,
   type GitHubAuthContext,
 } from "./github-client";
+import {
+  checkCalendarAvailability,
+  createCalendarEvent,
+  listCalendarEvents,
+  type GoogleCalendarAuthContext,
+} from "./google-calendar-client";
+import { searchContacts } from "./google-contacts-client";
 
 export interface PendingConfirmation {
   toolCallId: string;
@@ -30,6 +37,7 @@ interface PendingToolExecutionResult {
 
 export interface IntegrationSecrets {
   github?: GitHubAuthContext | null;
+  google?: GoogleCalendarAuthContext | null;
 }
 
 export interface ToolContext {
@@ -40,6 +48,41 @@ export interface ToolContext {
   integrations: UserIntegration[];
   integrationSecrets?: IntegrationSecrets;
 }
+
+const contactsLookupSchema = z.object({
+  names: z.array(z.string()).min(1).describe("List of person names to search"),
+});
+
+const calendarCheckAvailabilitySchema = z.object({
+  time_min: z.string().describe("Start of the first range in ISO 8601 format"),
+  time_max: z.string().describe("End of the first range in ISO 8601 format"),
+  extra_ranges: z
+    .array(
+      z.object({
+        time_min: z.string(),
+        time_max: z.string(),
+      })
+    )
+    .optional()
+    .default([])
+    .describe("Additional time ranges to check in the same query"),
+});
+
+const calendarListEventsSchema = z.object({
+  time_min: z.string(),
+  time_max: z.string(),
+  max_results: z.number().max(50).optional().default(20),
+});
+
+const calendarCreateEventSchema = z.object({
+  summary: z.string(),
+  start_date_time: z.string(),
+  end_date_time: z.string(),
+  description: z.string().optional().default(""),
+  location: z.string().optional().default(""),
+  time_zone: z.string().optional().default("UTC"),
+  attendee_emails: z.array(z.string()).optional().default([]).describe("List of attendee email addresses"),
+});
 
 const githubListReposSchema = z.object({
   per_page: z.number().max(30).optional().default(10),
@@ -87,6 +130,14 @@ function getGithubAuth(ctx: ToolContext): GitHubAuthContext {
     throw new Error("GitHub integration is not available for this user.");
   }
   return github;
+}
+
+function getGoogleAuth(ctx: ToolContext): GoogleCalendarAuthContext {
+  const google = ctx.integrationSecrets?.google;
+  if (!google?.accessToken) {
+    throw new Error("Google Calendar integration is not available for this user.");
+  }
+  return google;
 }
 
 function toPendingToolResult(pendingConfirmation: PendingConfirmation): string {
@@ -170,6 +221,114 @@ async function executeGithubTool(
   throw new Error(`Unsupported tool execution for ${toolName}`);
 }
 
+async function executeGoogleCalendarTool(
+  toolName: string,
+  rawInput: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolExecutionResult> {
+  const google = getGoogleAuth(ctx);
+
+  if (toolName === "contacts_lookup") {
+    const input = contactsLookupSchema.parse(rawInput);
+    const results = await Promise.all(
+      input.names.map((name) => searchContacts(google.accessToken, name))
+    );
+
+    const summary = results.map((r) => {
+      if (r.totalFound === 0) {
+        return { name: r.query, found: false, emails: [], message: `No se encontró "${r.query}" en los contactos.` };
+      }
+      if (r.totalFound === 1) {
+        return { name: r.found[0].name, found: true, emails: r.found[0].emails, message: `"${r.found[0].name}": ${r.found[0].emails.join(", ")}` };
+      }
+      return {
+        name: r.query,
+        found: true,
+        multiple: true,
+        contacts: r.found.map((c) => ({ name: c.name, emails: c.emails })),
+        message: `Se encontraron ${r.totalFound} contactos para "${r.query}": ${r.found.map((c) => `${c.name} (${c.emails[0]})`).join(", ")}`,
+      };
+    });
+
+    const allResolved = summary.every((s) => s.found && !("multiple" in s && s.multiple));
+    return {
+      message: allResolved
+        ? `Contactos encontrados: ${summary.map((s) => s.message).join(" | ")}`
+        : `Resultados de búsqueda: ${summary.map((s) => s.message).join(" | ")}`,
+      contacts: summary,
+    };
+  }
+
+  if (toolName === "calendar_check_availability") {
+    const input = calendarCheckAvailabilitySchema.parse(rawInput);
+
+    const allRanges = [
+      { time_min: input.time_min, time_max: input.time_max },
+      ...(input.extra_ranges ?? []),
+    ];
+
+    const results = await Promise.all(
+      allRanges.map((r) => checkCalendarAvailability(google, r.time_min, r.time_max))
+    );
+
+    const combined = results.map((r, i) => ({
+      range: `${r.queryRange.start} - ${r.queryRange.end}`,
+      date: r.date,
+      free: r.free,
+      busy: r.busy,
+      hasFreeTime: r.hasFreeTime,
+    }));
+
+    const totalFree = results.reduce((acc, r) => acc + r.free.length, 0);
+    const message =
+      totalFree > 0
+        ? `Se encontraron ${totalFree} espacio(s) libre(s) en los rangos consultados.`
+        : "No hay espacios libres en los rangos consultados.";
+
+    return { message, ranges: combined };
+  }
+
+  if (toolName === "calendar_list_events") {
+    const input = calendarListEventsSchema.parse(rawInput);
+    const result = await listCalendarEvents(google, input.time_min, input.time_max, input.max_results);
+    return {
+      message: `Se encontraron ${result.count} evento(s) en tu agenda.`,
+      events: result.events,
+    };
+  }
+
+  if (toolName === "calendar_create_event") {
+    const input = calendarCreateEventSchema.parse(rawInput);
+    const result = await createCalendarEvent(
+      google,
+      input.summary,
+      input.start_date_time,
+      input.end_date_time,
+      input.description,
+      input.location,
+      input.time_zone,
+      input.attendee_emails
+    );
+    return {
+      message: `Evento "${input.summary}" creado correctamente: ${result.htmlLink}`,
+      event: result.event,
+    };
+  }
+
+  throw new Error(`Unsupported calendar tool: ${toolName}`);
+}
+
+function routeToolExecution(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolExecutionResult> {
+  if (toolName.startsWith("calendar_") || toolName === "contacts_lookup") {
+    return executeGoogleCalendarTool(toolName, input, ctx);
+  }
+  return executeGithubTool(toolName, input, ctx);
+}
+
 async function executeImmediateTool(
   toolName: string,
   input: Record<string, unknown>,
@@ -178,7 +337,7 @@ async function executeImmediateTool(
   const record = await createToolCall(ctx.db, ctx.sessionId, toolName, input, false);
 
   try {
-    const result = await executeGithubTool(toolName, input, ctx);
+    const result = await routeToolExecution(toolName, input, ctx);
     await updateToolCallStatus(ctx.db, record.id, "executed", result);
     return JSON.stringify(result);
   } catch (error) {
@@ -213,6 +372,15 @@ async function createPendingConfirmation(
     });
   }
 
+  if (toolName === "calendar_create_event") {
+    const parsed = calendarCreateEventSchema.parse(input);
+    return toPendingToolResult({
+      toolCallId: record.id,
+      toolName,
+      message: `Confirma si deseas crear el evento "${parsed.summary}" el ${parsed.start_date_time}.`,
+    });
+  }
+
   throw new Error(`Pending confirmation is not supported for ${toolName}`);
 }
 
@@ -230,7 +398,7 @@ export async function executeToolCallById(
   }
 
   try {
-    const result = await executeGithubTool(toolCall.tool_name, toolCall.arguments_json, ctx);
+    const result = await routeToolExecution(toolCall.tool_name, toolCall.arguments_json, ctx);
     await updateToolCallStatus(ctx.db, toolCall.id, "executed", result);
     return { toolCall, result };
   } catch (error) {
@@ -342,6 +510,67 @@ export function buildLangChainTools(ctx: ToolContext) {
           name: "github_create_repo",
           description: "Creates a new GitHub repository. Requires confirmation.",
           schema: githubCreateRepoSchema,
+        }
+      )
+    );
+  }
+
+  if (isToolAvailable("contacts_lookup", ctx)) {
+    tools.push(
+      tool(
+        async (input) => executeImmediateTool("contacts_lookup", input, ctx),
+        {
+          name: "contacts_lookup",
+          description:
+            "Searches Google Contacts by name to find email addresses. Use before creating calendar events when attendee emails are not provided.",
+          schema: contactsLookupSchema,
+        }
+      )
+    );
+  }
+
+  if (isToolAvailable("calendar_check_availability", ctx)) {
+    tools.push(
+      tool(
+        async (input) => executeImmediateTool("calendar_check_availability", input, ctx),
+        {
+          name: "calendar_check_availability",
+          description:
+            "Checks the user's Google Calendar availability for a given time range. Returns busy periods.",
+          schema: calendarCheckAvailabilitySchema,
+        }
+      )
+    );
+  }
+
+  if (isToolAvailable("calendar_list_events", ctx)) {
+    tools.push(
+      tool(
+        async (input) => executeImmediateTool("calendar_list_events", input, ctx),
+        {
+          name: "calendar_list_events",
+          description: "Lists upcoming events from the user's Google Calendar within a time range.",
+          schema: calendarListEventsSchema,
+        }
+      )
+    );
+  }
+
+  if (isToolAvailable("calendar_create_event", ctx)) {
+    tools.push(
+      tool(
+        async (input) => {
+          const needsConfirm = toolRequiresConfirmation("calendar_create_event");
+          if (needsConfirm) {
+            return createPendingConfirmation("calendar_create_event", input, ctx);
+          }
+          return executeImmediateTool("calendar_create_event", input, ctx);
+        },
+        {
+          name: "calendar_create_event",
+          description:
+            "Creates a new event in the user's Google Calendar. Requires confirmation.",
+          schema: calendarCreateEventSchema,
         }
       )
     );

@@ -11,6 +11,7 @@ interface Props {
   telegramLinked: boolean;
   githubConnected: boolean;
   githubScopes: string[];
+  googleConnected: boolean;
 }
 
 const TOOL_IDS = [
@@ -20,6 +21,10 @@ const TOOL_IDS = [
   "github_list_issues",
   "github_create_issue",
   "github_create_repo",
+  "contacts_lookup",
+  "calendar_check_availability",
+  "calendar_list_events",
+  "calendar_create_event",
 ];
 
 export function SettingsForm({
@@ -29,11 +34,13 @@ export function SettingsForm({
   telegramLinked,
   githubConnected,
   githubScopes,
+  googleConnected,
 }: Props) {
   const router = useRouter();
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [disconnectingGithub, setDisconnectingGithub] = useState(false);
+  const [disconnectingGoogle, setDisconnectingGoogle] = useState(false);
 
   const [name, setName] = useState((profile?.name as string) ?? "");
   const [agentName, setAgentName] = useState((profile?.agent_name as string) ?? "Agente");
@@ -97,12 +104,27 @@ export function SettingsForm({
   async function disconnectGithub() {
     setDisconnectingGithub(true);
     try {
-      await fetch("/api/integrations/github/disconnect", {
-        method: "POST",
-      });
-      router.refresh();
+      await fetch("/api/integrations/github/disconnect", { method: "POST" });
+      window.location.href = "/settings";
     } finally {
       setDisconnectingGithub(false);
+    }
+  }
+
+  async function disconnectGoogle() {
+    setDisconnectingGoogle(true);
+    try {
+      const res = await fetch("/api/integrations/google/disconnect", { method: "POST" });
+      if (res.ok) {
+        window.location.href = "/settings";
+      } else {
+        const body = await res.json().catch(() => ({}));
+        console.error("Error al desconectar Google:", body);
+        setDisconnectingGoogle(false);
+      }
+    } catch (err) {
+      console.error("Error al desconectar Google:", err);
+      setDisconnectingGoogle(false);
     }
   }
 
@@ -196,6 +218,36 @@ export function SettingsForm({
               className="inline-flex rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium hover:bg-neutral-50 dark:border-neutral-700 dark:hover:bg-neutral-900"
             >
               Conectar GitHub
+            </a>
+          </div>
+        )}
+      </section>
+
+      {/* Google Calendar */}
+      <section className="space-y-4">
+        <h2 className="text-base font-semibold">Google Calendar</h2>
+        {googleConnected ? (
+          <div className="space-y-3">
+            <p className="text-sm text-green-600">Google Calendar conectado.</p>
+            <button
+              onClick={disconnectGoogle}
+              disabled={disconnectingGoogle}
+              className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium hover:bg-neutral-50 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-900"
+            >
+              {disconnectingGoogle ? "Desconectando..." : "Desconectar Google Calendar"}
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <p className="text-sm text-neutral-500">
+              Conecta tu cuenta de Google para que el agente consulte y gestione tu agenda desde
+              Telegram.
+            </p>
+            <a
+              href="/api/integrations/google/authorize"
+              className="inline-flex rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium hover:bg-neutral-50 dark:border-neutral-700 dark:hover:bg-neutral-900"
+            >
+              Conectar Google Calendar
             </a>
           </div>
         )}

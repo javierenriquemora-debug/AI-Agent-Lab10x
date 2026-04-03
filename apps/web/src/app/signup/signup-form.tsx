@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { createBrowserClient } from "@supabase/ssr";
 
 export function SignupForm() {
@@ -9,7 +8,6 @@ export function SignupForm() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const router = useRouter();
 
   const supabase = createBrowserClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -21,7 +19,7 @@ export function SignupForm() {
     setLoading(true);
     setError(null);
 
-    const { error } = await supabase.auth.signUp({
+    const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: { emailRedirectTo: `${window.location.origin}/auth/callback` },
@@ -33,8 +31,13 @@ export function SignupForm() {
       return;
     }
 
-    router.push("/onboarding");
-    router.refresh();
+    if (!data.session) {
+      setError("La cuenta se creo, pero no se pudo iniciar sesion automaticamente.");
+      setLoading(false);
+      return;
+    }
+
+    window.location.assign("/onboarding");
   }
 
   return (

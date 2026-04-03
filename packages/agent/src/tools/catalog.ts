@@ -78,6 +78,118 @@ export const TOOL_CATALOG: ToolDefinition[] = [
       required: ["name"],
     },
   },
+  {
+    id: "contacts_lookup",
+    name: "contacts_lookup",
+    description:
+      "Searches the user's Google Contacts by name to find email addresses. Use this before creating calendar events when attendee emails are not provided. Supports searching multiple names at once.",
+    risk: "low",
+    requires_integration: "google",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        names: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of person names to search for (one search per name)",
+        },
+      },
+      required: ["names"],
+    },
+  },
+  {
+    id: "calendar_check_availability",
+    name: "calendar_check_availability",
+    description:
+      "Checks the user's Google Calendar availability for one or more time ranges. Returns free and busy slots in local time. Use extra_ranges to check multiple windows in a single call (e.g. 8-12 and 14-18).",
+    risk: "low",
+    requires_integration: "google",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        time_min: {
+          type: "string",
+          description: "Start of the first range in ISO 8601 format with timezone offset (e.g. 2026-04-08T08:00:00-05:00)",
+        },
+        time_max: {
+          type: "string",
+          description: "End of the first range in ISO 8601 format with timezone offset",
+        },
+        extra_ranges: {
+          type: "array",
+          description: "Additional time ranges to check in the same query",
+          items: {
+            type: "object",
+            properties: {
+              time_min: { type: "string" },
+              time_max: { type: "string" },
+            },
+            required: ["time_min", "time_max"],
+          },
+        },
+      },
+      required: ["time_min", "time_max"],
+    },
+  },
+  {
+    id: "calendar_list_events",
+    name: "calendar_list_events",
+    description: "Lists upcoming events from the user's Google Calendar within a time range.",
+    risk: "low",
+    requires_integration: "google",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        time_min: {
+          type: "string",
+          description: "Start of the range in ISO 8601 format",
+        },
+        time_max: {
+          type: "string",
+          description: "End of the range in ISO 8601 format",
+        },
+        max_results: {
+          type: "number",
+          description: "Maximum number of events to return (default 20)",
+        },
+      },
+      required: ["time_min", "time_max"],
+    },
+  },
+  {
+    id: "calendar_create_event",
+    name: "calendar_create_event",
+    description:
+      "Creates a new event in the user's Google Calendar. Requires confirmation.",
+    risk: "medium",
+    requires_integration: "google",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        summary: { type: "string", description: "Event title" },
+        start_date_time: {
+          type: "string",
+          description: "Start date/time in ISO 8601 format",
+        },
+        end_date_time: {
+          type: "string",
+          description: "End date/time in ISO 8601 format",
+        },
+        description: { type: "string", description: "Event description (optional)" },
+        location: { type: "string", description: "Event location (optional)" },
+        time_zone: {
+          type: "string",
+          description: "IANA timezone (e.g. America/Bogota). Defaults to UTC.",
+        },
+        attendee_emails: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of attendee email addresses to invite",
+        },
+      },
+      required: ["summary", "start_date_time", "end_date_time"],
+    },
+  },
 ];
 
 export function getToolRisk(toolId: string): ToolRisk {

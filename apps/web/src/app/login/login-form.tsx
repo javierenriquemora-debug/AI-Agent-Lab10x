@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { createBrowserClient } from "@supabase/ssr";
 
 export function LoginForm() {
@@ -9,7 +8,6 @@ export function LoginForm() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const router = useRouter();
 
   const supabase = createBrowserClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -21,7 +19,7 @@ export function LoginForm() {
     setLoading(true);
     setError(null);
 
-    const { error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -32,8 +30,13 @@ export function LoginForm() {
       return;
     }
 
-    router.push("/");
-    router.refresh();
+    if (!data.session) {
+      setError("No se pudo establecer la sesion. Intenta de nuevo.");
+      setLoading(false);
+      return;
+    }
+
+    window.location.assign("/");
   }
 
   return (

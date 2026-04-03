@@ -50,6 +50,34 @@ const AVAILABLE_TOOLS = [
     risk: "medium" as const,
     requiresIntegration: "github",
   },
+  {
+    id: "contacts_lookup",
+    name: "Google Contacts: buscar contacto",
+    description: "Busca el email de tus contactos de Google por nombre.",
+    risk: "low" as const,
+    requiresIntegration: "google",
+  },
+  {
+    id: "calendar_check_availability",
+    name: "Google Calendar: verificar disponibilidad",
+    description: "Consulta tus bloques libres y ocupados en un rango de fechas.",
+    risk: "low" as const,
+    requiresIntegration: "google",
+  },
+  {
+    id: "calendar_list_events",
+    name: "Google Calendar: listar eventos",
+    description: "Lista tus eventos próximos en un rango de fechas.",
+    risk: "low" as const,
+    requiresIntegration: "google",
+  },
+  {
+    id: "calendar_create_event",
+    name: "Google Calendar: crear evento",
+    description: "Crea un nuevo evento en tu agenda (requiere confirmación).",
+    risk: "medium" as const,
+    requiresIntegration: "google",
+  },
 ];
 
 const RISK_LABELS = {

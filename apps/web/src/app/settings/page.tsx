@@ -31,6 +31,13 @@ export default async function SettingsPage() {
     .eq("provider", "github")
     .maybeSingle();
 
+  const { data: googleIntegration } = await supabase
+    .from("user_integrations")
+    .select("provider, scopes, status")
+    .eq("user_id", user.id)
+    .eq("provider", "google")
+    .maybeSingle();
+
   return (
     <div className="min-h-screen">
       <header className="border-b border-neutral-200 px-4 py-3 dark:border-neutral-800">
@@ -52,6 +59,7 @@ export default async function SettingsPage() {
           telegramLinked={!!telegramAccount}
           githubConnected={githubIntegration?.status === "active"}
           githubScopes={(githubIntegration?.scopes as string[] | null) ?? []}
+          googleConnected={googleIntegration?.status === "active"}
         />
       </main>
     </div>

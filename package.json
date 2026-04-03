@@ -9,7 +9,10 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
+    "dev:web": "npm run dev --workspace @agents/web",
     "lint": "turbo run lint",
+    "restart:web": "npm run stop:web && npm run dev:web",
+    "stop:web": "node ./scripts/stop-port.mjs 3000",
     "type-check": "turbo run type-check"
   },
   "devDependencies": {

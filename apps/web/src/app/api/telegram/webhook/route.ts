@@ -7,7 +7,13 @@ import {
 } from "@agents/db";
 import { executeToolCallById, runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
-import type { DbClient } from "@agents/db";
+import {
+  injectSchedulingDirective,
+  injectSchedulingContinuation,
+  rejectAllPendingConfirmations,
+  markdownToHtml,
+  REJECTION_RE,
+} from "@/lib/message-preprocessing";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET ?? "";
@@ -37,6 +43,7 @@ interface TelegramUpdate {
   };
 }
 
+
 async function sendTelegramMessage(
   chatId: number,
   text: string,
@@ -47,7 +54,7 @@ async function sendTelegramMessage(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text,
+      text: markdownToHtml(text),
       parse_mode: "HTML",
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     }),
@@ -124,139 +131,6 @@ async function transcribeVoice(fileId: string): Promise<string> {
   return whisperData.text?.trim() ?? "";
 }
 
-const SCHEDULE_INTENT_RE = /\b(agenda|agendar|programa|programar|crea(r)?\s+(un\s+)?(evento|reuni[oó]n|espacio|cita)|reuni[oó]n|meeting)\b/i;
-// Specific clock time (required to consider time "complete")
-const HOUR_REF_RE = /\b(a las\s+\d|am\b|pm\b|\d{1,2}:\d{2}|\d{1,2}\s*(am|pm))/i;
-// Day reference only (date without time)
-const DAY_REF_RE = /\b(ma[ñn]ana|hoy|lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|pr[oó]ximo|siguiente|\d{1,2}\s+de\s+[a-z]+)/i;
-// Full datetime = has a day AND a clock time
-const FULL_DATETIME_RE = new RegExp(`(${HOUR_REF_RE.source})`, "i");
-const EMAIL_RE = /[\w.+-]+@[\w.-]+\.\w{2,}/;
-// Requires a real name (2+ chars per word) after "con/invita/para" — avoids "para el"
-const PERSON_NAME_RE = /\b(con|invita?)\s+[a-záéíóúñA-ZÁÉÍÓÚÑ]{2,}(\s+[a-záéíóúñA-ZÁÉÍÓÚÑ]{2,})?/i;
-// Explicit email is also a participant signal
-// Subject markers — words that clearly indicate a meeting subject
-const SUBJECT_MARKER_RE = /\b(asunto|tema|sobre|acerca|revisar|revisión|presentación|propuesta|seguimiento|discutir|entrevista|capacitación|call de|sync de)\b/i;
-
-// Patterns that indicate the assistant was collecting scheduling data
-const SCHEDULING_FLOW_RE = /Para agendar necesito|Fecha y hora de inicio|asunto de la reuni|¿Cuál es el asunto|¿A qué hora|¿Cuándo|¿Con quién|hora de la reuni|fecha prefieres|qué fecha|qué día|hora de inicio|¿Cuál es la fecha/i;
-
-/**
- * If the message contains scheduling intent + time + (email OR person name),
- * prepend an explicit directive so the model resolves contacts and creates the event.
- */
-function injectSchedulingDirective(text: string): string {
-  const hasScheduleIntent = SCHEDULE_INTENT_RE.test(text);
-  const hasEmail = EMAIL_RE.test(text);
-  const hasPersonName = PERSON_NAME_RE.test(text);
-  const hasHour = HOUR_REF_RE.test(text);
-  const hasDay = DAY_REF_RE.test(text);
-
-  // Full data in one message (needs day + clock hour + participant/email)
-  if (hasScheduleIntent && hasDay && hasHour && (hasEmail || hasPersonName)) {
-    if (hasEmail) {
-      return `[AGENDAMIENTO COMPLETO: fecha/hora, asunto y email presentes. Llama calendar_create_event AHORA sin preguntas.]\n\n${text}`;
-    }
-    return `[AGENDAMIENTO con nombre de persona. Llama contacts_lookup con los nombres detectados, luego calendar_create_event.]\n\n${text}`;
-  }
-
-  // Has intent + participant but no time → ask only for date/time and subject
-  if (hasScheduleIntent && (hasEmail || hasPersonName)) {
-    return `[El usuario quiere agendar y ya mencionó participante(s). Pregunta SOLO la fecha, hora de inicio y el asunto. NO pidas participantes.]\n\n${text}`;
-  }
-
-  return text;
-}
-
-/**
- * Detects if the current message is a continuation of a scheduling conversation.
- * Passes the full user message history so the LLM can extract data itself.
- */
-async function injectSchedulingContinuation(
-  db: DbClient,
-  sessionId: string,
-  text: string
-): Promise<string> {
-  // If this message already has scheduling intent, already handled above
-  if (SCHEDULE_INTENT_RE.test(text)) return text;
-
-  // Fetch last 10 messages to understand the conversation state
-  const { data: messages } = await db
-    .from("agent_messages")
-    .select("role, content")
-    .eq("session_id", sessionId)
-    .order("created_at", { ascending: false })
-    .limit(10);
-
-  if (!messages || messages.length === 0) return text;
-
-  // Check if last assistant message was part of a scheduling data collection flow
-  const lastAssistant = messages.find((m) => m.role === "assistant");
-  const lastAssistantContent = (lastAssistant?.content as string) ?? "";
-  if (!SCHEDULING_FLOW_RE.test(lastAssistantContent)) return text;
-
-  // Find the START of the current scheduling flow by locating the most recent
-  // user message that contains scheduling intent. Only use messages from that
-  // point forward — this prevents data from previous conversations bleeding in.
-  const chronological = [...messages].reverse(); // oldest first
-  let flowStartIdx = -1;
-  for (let i = chronological.length - 1; i >= 0; i--) {
-    const m = chronological[i];
-    const raw = (m.content as string).replace(/^\[[\s\S]*?\]\n\n/, "");
-    if (m.role === "user" && SCHEDULE_INTENT_RE.test(raw)) {
-      flowStartIdx = i;
-      break;
-    }
-  }
-
-  if (flowStartIdx === -1) return text; // no scheduling trigger found
-
-  // Only messages from the current flow
-  const flowMessages = chronological.slice(flowStartIdx);
-  const flowUserContents = flowMessages
-    .filter((m) => m.role === "user")
-    .map((m) => (m.content as string).replace(/^\[[\s\S]*?\]\n\n/, ""));
-
-  const prevUserSummary = flowUserContents
-    .map((c, i) => `  ${i + 1}. "${c}"`)
-    .join("\n");
-
-  // What data exists in this flow + current message
-  const flowContent = [...flowUserContents, text].join(" ");
-  const hasParticipant = PERSON_NAME_RE.test(flowContent) || EMAIL_RE.test(flowContent);
-  const hasDay = DAY_REF_RE.test(flowContent);
-  const hasHour = HOUR_REF_RE.test(flowContent);
-
-  // Subject: marked known if any message contains a subject keyword,
-  // OR if the last agent message was specifically asking for subject
-  const lastAgentWasAskingSubject = /asunto|tema|motivo|de qué (es|trata|será)/i.test(lastAssistantContent);
-  const hasSubject = SUBJECT_MARKER_RE.test(flowContent) || lastAgentWasAskingSubject;
-
-  const missing: string[] = [];
-  if (!hasParticipant) missing.push("👤 Participantes (nombre o correo)");
-  if (!hasDay) missing.push("📅 Fecha (día)");
-  if (!hasHour) missing.push("🕐 Hora de inicio");
-  if (!hasSubject) missing.push("📋 Asunto de la reunión");
-
-  if (missing.length === 0) {
-    return (
-      `[CONTINUACIÓN DE AGENDAMIENTO.\n` +
-      `Mensajes de este flujo:\n${prevUserSummary}\n` +
-      `Mensaje actual: "${text}"\n` +
-      `INSTRUCCIÓN: Ya tienes TODOS los datos (participante, día, hora y asunto). ` +
-      `Llama contacts_lookup si hay nombres sin email, luego calendar_create_event AHORA.]\n\n${text}`
-    );
-  }
-
-  return (
-    `[CONTINUACIÓN DE AGENDAMIENTO.\n` +
-    `Mensajes de este flujo:\n${prevUserSummary}\n` +
-    `Mensaje actual: "${text}"\n` +
-    `INSTRUCCIÓN: Usa SOLO los mensajes de este flujo. ` +
-    `Falta recopilar: ${missing.join(", ")}. ` +
-    `Pide SOLO el primer dato que falte. NO uses datos de conversaciones anteriores. NO listes servicios.]\n\n${text}`
-  );
-}
 
 export async function POST(request: Request) {
   const secret = request.headers.get("x-telegram-bot-api-secret-token");
@@ -458,6 +332,40 @@ export async function POST(request: Request) {
   if (!session) {
     await sendTelegramMessage(chatId, "Error interno creando sesión.");
     return NextResponse.json({ ok: true });
+  }
+
+  // If the user is rejecting, check two cases:
+  // 1. There is a pending tool call confirmation → cancel it.
+  // 2. The last assistant message was proposing scheduling → treat as rejection.
+  // In both cases close ALL active sessions so the LLM starts fresh.
+  if (REJECTION_RE.test(text.trim())) {
+    const cancelled = await rejectAllPendingConfirmations(db, session.id);
+
+    const { data: lastMsg } = await db
+      .from("agent_messages")
+      .select("content")
+      .eq("session_id", session.id)
+      .eq("role", "assistant")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const lastContent = (lastMsg?.content as string) ?? "";
+    const SCHEDULING_PROPOSAL_RE =
+      /agendar|agenda|crear el evento|proceder|programar|¿deseas|deseas proceder|¿te gustaría/i;
+    const wasSchedulingProposal = SCHEDULING_PROPOSAL_RE.test(lastContent);
+
+    if (cancelled > 0 || wasSchedulingProposal) {
+      await db
+        .from("agent_sessions")
+        .update({ status: "closed" })
+        .eq("user_id", telegramAccount.user_id)
+        .eq("channel", "telegram")
+        .eq("status", "active");
+      const reply = "Entendido, ¿en qué más puedo ayudarte?";
+      await sendTelegramMessage(chatId, reply);
+      return NextResponse.json({ ok: true });
+    }
   }
 
   // If we're in a scheduling conversation, enrich the message with context

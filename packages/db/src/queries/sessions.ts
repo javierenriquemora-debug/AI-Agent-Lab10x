@@ -45,6 +45,16 @@ export async function getOrCreateSession(
 ) {
   const existing = await getActiveSession(db, userId, channel);
   if (existing) return existing;
+
+  // Close any leftover active sessions before creating a new one to prevent
+  // multiple active sessions accumulating and leaking stale conversation context.
+  await db
+    .from("agent_sessions")
+    .update({ status: "closed" })
+    .eq("user_id", userId)
+    .eq("channel", channel)
+    .eq("status", "active");
+
   return createSession(db, userId, channel);
 }
 

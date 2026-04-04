@@ -95,7 +95,15 @@ Desde la **raíz** del repo:
 npm run dev
 ```
 
-Por defecto Turbo ejecuta el `dev` de cada paquete; la app suele quedar en **http://localhost:3000**.
+Por defecto Turbo ejecuta el `dev` de cada paquete; la app queda en **http://localhost:3000**.
+
+> **⚠ Puerto fijo 3000 — no cambiar.**  
+> El script `dev` en `apps/web/package.json` está configurado con `next dev -p 3000` para forzar siempre el mismo puerto.  
+> Esto es necesario porque el túnel **ngrok** (usado para el webhook de Telegram) apunta a `localhost:3000`.  
+> Si necesitas cambiar el puerto, actualiza también:  
+> - `apps/web/package.json` → script `dev`  
+> - El túnel ngrok (`ngrok http <nuevo_puerto>`)  
+> - La URL del webhook en Telegram (visita `/api/telegram/setup` de nuevo con la nueva URL de ngrok)
 
 Flujo esperado:
 

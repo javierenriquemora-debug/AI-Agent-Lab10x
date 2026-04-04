@@ -236,27 +236,33 @@ async function executeGoogleCalendarTool(
 
     const summary = results.map((r) => {
       if (r.totalFound === 0) {
-        return { name: r.query, found: false, emails: [], message: `No se encontró "${r.query}" en los contactos.` };
+        return { name: r.query, found: false, emails: [] as string[], resolvedEmail: null as string | null, message: `No se encontro "${r.query}" en los contactos.` };
       }
       if (r.totalFound === 1) {
-        return { name: r.found[0].name, found: true, emails: r.found[0].emails, message: `"${r.found[0].name}": ${r.found[0].emails.join(", ")}` };
+        return { name: r.found[0].name, found: true, emails: r.found[0].emails, resolvedEmail: r.found[0].emails[0], message: `${r.found[0].name}: ${r.found[0].emails[0]}` };
       }
       return {
         name: r.query,
         found: true,
         multiple: true,
-        contacts: r.found.map((c) => ({ name: c.name, emails: c.emails })),
-        message: `Se encontraron ${r.totalFound} contactos para "${r.query}": ${r.found.map((c) => `${c.name} (${c.emails[0]})`).join(", ")}`,
+        emails: r.found.flatMap((c) => c.emails),
+        resolvedEmail: null as string | null,
+        contacts: r.found.map((c) => ({ name: c.name, email: c.emails[0] })),
+        message: `Multiples resultados para "${r.query}": ${r.found.map((c) => `${c.name} (${c.emails[0]})`).join(", ")}. Confirma cual es el correcto.`,
       };
     });
 
-    const allResolved = summary.every((s) => s.found && !("multiple" in s && s.multiple));
-    return {
-      message: allResolved
-        ? `Contactos encontrados: ${summary.map((s) => s.message).join(" | ")}`
-        : `Resultados de búsqueda: ${summary.map((s) => s.message).join(" | ")}`,
-      contacts: summary,
-    };
+    const resolved = summary.filter((s) => s.found && s.resolvedEmail).map((s) => `${s.name}: ${s.resolvedEmail}`);
+    const notFound = summary.filter((s) => !s.found).map((s) => s.name);
+    const needsConfirm = summary.filter((s) => s.found && !s.resolvedEmail).map((s) => s.message);
+
+    let message = "";
+    if (resolved.length > 0) message += `Emails resueltos:\n${resolved.map((r) => `- ${r}`).join("\n")}\n`;
+    if (needsConfirm.length > 0) message += `\nAmbiguos (pide confirmacion):\n${needsConfirm.join("\n")}\n`;
+    if (notFound.length > 0) message += `\nNo encontrados: ${notFound.join(", ")}. Pide su email al usuario.\n`;
+    message += `\nIMPORTANTE: Al crear el evento incluye TODOS los emails resueltos: ${summary.filter((s) => s.resolvedEmail).map((s) => s.resolvedEmail).join(", ")}`;
+
+    return { message: message.trim(), contacts: summary };
   }
 
   if (toolName === "calendar_check_availability") {

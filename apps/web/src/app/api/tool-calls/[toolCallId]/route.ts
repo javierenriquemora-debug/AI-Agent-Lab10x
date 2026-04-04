@@ -57,7 +57,15 @@ export async function POST(
       return NextResponse.json({ error: "Tool call already processed" }, { status: 409 });
     }
 
-    await addMessage(db, rejectedToolCall.session_id, "assistant", "Acción cancelada.");
+    // Close ALL active web sessions for this user so the next message starts
+    // with a clean context and cannot re-trigger the cancelled scheduling flow.
+    await db
+      .from("agent_sessions")
+      .update({ status: "closed" })
+      .eq("user_id", user.id)
+      .eq("channel", "web")
+      .eq("status", "active");
+
     return NextResponse.json({ ok: true, message: "Acción cancelada." });
   }
 

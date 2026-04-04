@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { createServerClient } from "@agents/db";
+import { createServerClient, getOrCreateSession } from "@agents/db";
 import { runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
+import {
+  injectSchedulingDirective,
+  injectSchedulingContinuation,
+  rejectAllPendingConfirmations,
+  REJECTION_RE,
+} from "@/lib/message-preprocessing";
 
 export async function POST(request: Request) {
   try {
@@ -20,38 +26,51 @@ export async function POST(request: Request) {
     const db = createServerClient();
     const runtime = await loadAgentRuntimeContext(db, user.id);
 
-    let session = await supabase
-      .from("agent_sessions")
-      .select("*")
-      .eq("user_id", user.id)
-      .eq("channel", "web")
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .single()
-      .then((r) => r.data);
-
-    if (!session) {
-      const { data } = await supabase
-        .from("agent_sessions")
-        .insert({
-          user_id: user.id,
-          channel: "web",
-          status: "active",
-          budget_tokens_used: 0,
-          budget_tokens_limit: 100000,
-        })
-        .select()
-        .single();
-      session = data;
-    }
-
+    // Use the service-role db client for all session operations so they always
+    // succeed regardless of user-auth token state or RLS edge cases.
+    const session = await getOrCreateSession(db, user.id, "web");
     if (!session) {
       return NextResponse.json({ error: "Failed to create session" }, { status: 500 });
     }
 
+    // If the user is rejecting, check two cases:
+    // 1. There is a pending tool call confirmation → cancel it.
+    // 2. The last assistant message was proposing scheduling → treat as rejection.
+    // In both cases close ALL active sessions so the LLM starts fresh.
+    if (REJECTION_RE.test(message.trim())) {
+      const cancelled = await rejectAllPendingConfirmations(db, session.id);
+
+      const { data: lastMsg } = await db
+        .from("agent_messages")
+        .select("content")
+        .eq("session_id", session.id)
+        .eq("role", "assistant")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const lastContent = (lastMsg?.content as string) ?? "";
+      const SCHEDULING_PROPOSAL_RE =
+        /agendar|agenda|crear el evento|proceder|programar|¿deseas|deseas proceder|¿te gustaría/i;
+      const wasSchedulingProposal = SCHEDULING_PROPOSAL_RE.test(lastContent);
+
+      if (cancelled > 0 || wasSchedulingProposal) {
+        await db
+          .from("agent_sessions")
+          .update({ status: "closed" })
+          .eq("user_id", user.id)
+          .eq("channel", "web")
+          .eq("status", "active");
+        const reply = "Entendido, ¿en qué más puedo ayudarte?";
+        return NextResponse.json({ response: reply });
+      }
+    }
+
+    let processedMessage = injectSchedulingDirective(message);
+    processedMessage = await injectSchedulingContinuation(db, session.id, processedMessage);
+
     const result = await runAgent({
-      message,
+      message: processedMessage,
       userId: user.id,
       sessionId: session.id,
       systemPrompt: runtime.systemPrompt,

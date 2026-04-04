@@ -219,6 +219,7 @@ export async function POST(request: Request) {
         await sendTelegramMessage(chatId, "No pude transcribir tu mensaje de voz. Intenta de nuevo.");
         return NextResponse.json({ ok: true });
       }
+      await sendTelegramMessage(chatId, `🎤 <i>${text}</i>`);
     } catch (err) {
       console.error("Voice transcription error:", err);
       await sendTelegramMessage(chatId, "Hubo un error transcribiendo tu voz. Intenta de nuevo.");

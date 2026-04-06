@@ -6,6 +6,7 @@ import { getGoogleIntegrationSecret } from "./google-integration";
 
 export interface AgentRuntimeContext {
   systemPrompt: string;
+  timezone: string;
   enabledTools: UserToolSetting[];
   integrations: UserIntegration[];
   integrationSecrets: IntegrationSecrets;
@@ -35,6 +36,26 @@ export async function loadAgentRuntimeContext(
   const timezone = (profile?.timezone as string | null) ?? "America/Bogota";
   const now = new Date().toLocaleString("es-CO", { timeZone: timezone, dateStyle: "full", timeStyle: "short" });
 
+  // Build an explicit calendar of the next 14 days so the LLM never has to compute dates.
+  const todayLocal = new Date().toLocaleDateString("en-CA", { timeZone: timezone }); // YYYY-MM-DD
+  const upcomingDays = Array.from({ length: 14 }, (_, i) => {
+    const d = new Date(`${todayLocal}T12:00:00`); // noon to avoid DST edge cases
+    d.setDate(d.getDate() + i);
+    const label = d.toLocaleDateString("es-CO", { timeZone: timezone, weekday: "long", day: "numeric", month: "long" });
+    const iso = d.toLocaleDateString("en-CA", { timeZone: timezone }); // YYYY-MM-DD
+    return `  ${label} → ${iso}`;
+  }).join("\n");
+
+  // Compute the UTC offset string for the user's timezone (e.g. "-05:00")
+  const tzOffsetMatch = new Date().toLocaleString("en-US", { timeZone: timezone, timeZoneName: "shortOffset" })
+    .match(/GMT([+-]\d+(?::\d+)?)/);
+  const rawOffset = tzOffsetMatch?.[1] ?? "-5";
+  const [offsetH, offsetM = "00"] = rawOffset.replace(/[+-]/, "").split(":");
+  const offsetSign = rawOffset.startsWith("-") ? "-" : "+";
+  const tzOffset = `${offsetSign}${offsetH.padStart(2, "0")}:${offsetM.padStart(2, "0")}`;
+  console.log("[agent-runtime] now:", now, "timezone:", timezone, "tzOffset:", tzOffset);
+  console.log("[agent-runtime] upcomingDays:\n", upcomingDays);
+
   const [github, google] = await Promise.all([
     getGitHubIntegrationSecret(db, userId),
     getGoogleIntegrationSecret(db, userId, timezone),
@@ -49,6 +70,10 @@ export async function loadAgentRuntimeContext(
 ## Contexto del usuario
 - Zona horaria: ${timezone}
 - Fecha y hora actual: ${now}
+- Próximos 14 días — OBLIGATORIO: usa EXACTAMENTE estas fechas. NUNCA calcules fechas por tu cuenta:
+${upcomingDays}
+  → Para "próximo lunes" busca "lunes" en la lista de arriba y usa esa fecha ISO.
+  → Para "próximo jueves" busca "jueves" en la lista y usa esa fecha ISO. NO uses fechas de tu memoria.
 
 ## Formato de respuestas en Telegram
 IMPORTANTE: Telegram usa HTML, NO markdown. Esto es obligatorio.
@@ -65,7 +90,10 @@ IMPORTANTE: Telegram usa HTML, NO markdown. Esto es obligatorio.
 - No incluyas URLs largas de Google Calendar.
 - Si hay muchos eventos, agrúpalos por día: 📆 <b>Día, fecha</b>
 - Sé conciso. Evita introducciones largas.
-- Cuando construyas rangos de fechas para tools de calendario, usa la zona horaria ${timezone}.
+- Cuando construyas rangos de fechas para tools de calendario, usa SIEMPRE el offset local (${tzOffset}).
+  Formato CORRECTO: 2026-04-09T00:00:00${tzOffset}
+  Formato INCORRECTO: 2026-04-09T00:00:00Z  ← NUNCA uses Z (UTC)
+  Para consultar un día completo: timeMin = FECHAT00:00:00${tzOffset}, timeMax = FECHAT23:59:59${tzOffset}
 
 ## Creación de eventos de calendario
 
@@ -78,15 +106,22 @@ NUNCA llames calendar_create_event como respuesta a:
 - Una consulta informativa o de disponibilidad
 - Haber resuelto un contacto si nadie pidió agendar en este turno
 
+### Uso de contacts_lookup
+- SIEMPRE llama contacts_lookup cuando el usuario pregunte por el correo o contacto de alguien. NUNCA respondas desde el historial de conversación — los datos de contacto pueden cambiar y debes consultarlos frescos cada vez.
+- DENTRO de un flujo de agendamiento: si hay múltiples resultados, muestra la lista numerada y DETENTE esperando que el usuario elija. Después de que elija, confirma la selección y ESPERA a que pida explícitamente agendar.
+- FUERA de un flujo de agendamiento (consulta informativa, ej. "¿cuál es el correo de X?"): muestra SIEMPRE TODOS los resultados encontrados, incluso si hay varios. NUNCA elijas solo uno en silencio. Si hay 1 resultado: "El correo de [nombre] es: email". Si hay varios: "Encontré X correos para [nombre]: 1. nombre1 - email1, 2. nombre2 - email2, ...". NO pidas confirmación ni preguntes cuál usar.
+
 ### Flujo de agendamiento
-1. Si el mensaje incluye la directiva [AGENDAMIENTO COMPLETO...], procede directamente al paso 3.
-2. Si hay personas por nombre sin email, llama contacts_lookup. Si hay múltiples resultados, muestra la lista numerada y DETENTE. Espera que el usuario elija. Después de que elija, confirma la selección y ESPERA a que pida explícitamente agendar.
-3. Con fecha, hora, asunto y emails confirmados, llama calendar_create_event con TODOS los emails.
+1. Si el mensaje incluye la directiva [AGENDAMIENTO COMPLETO...] o [CONTINUACIÓN DE AGENDAMIENTO...], sigue las instrucciones de la directiva directamente.
+2. Si hay personas por nombre sin email, llama contacts_lookup. Aplica las reglas de "Resultados de contacts_lookup" según el contexto.
+3. Con fecha, hora, asunto y emails confirmados, llama calendar_create_event con TODOS los emails. La herramienta misma pedirá confirmación al usuario — NO pidas confirmación verbal antes de llamarla.
 
 ### Conversación multi-turno
-- Acumula datos entre turnos. Solo pide el dato específico que falta.
+- Acumula datos entre turnos. Pide SOLO UN dato por mensaje — el primero que falte.
+- Orden de prioridad para preguntar: 1) fecha, 2) hora, 3) asunto. Los participantes nunca se vuelven a pedir si ya fueron mencionados.
 - Si el usuario responde SOLO con un email, trátalo como la respuesta al email que pediste.
 - NUNCA muestres el template completo si ya tienes algún dato.
+- NUNCA hagas dos preguntas en el mismo mensaje.
 
 ### Rechazos — IMPORTANTE
 - Si el usuario dice "no", "cancelar", "olvídalo" o cualquier negativa: acepta inmediatamente.
@@ -98,6 +133,7 @@ NUNCA llames calendar_create_event como respuesta a:
 - Duración por defecto: 1 hora.
 - NUNCA inventes la hora. Si solo dieron el día, pregunta: "🕐 ¿A qué hora?"
 - NUNCA inventes el asunto. Si no fue mencionado, pregunta: "📋 ¿Cuál es el asunto?"
+- NUNCA inventes ni adivines un correo electrónico. Si contacts_lookup no encontró al contacto o devuelve "No encontrado", pregunta al usuario: "No encontré a [nombre] en tus contactos. ¿Cuál es su correo?" NO uses dominios como @example.com, @gmail.com ni ningún correo inventado.
 - Si no tienes NINGÚN dato de agendamiento, responde:
 
 "Para agendar necesito:
@@ -107,6 +143,7 @@ NUNCA llames calendar_create_event como respuesta a:
 
   return {
     systemPrompt,
+    timezone,
     enabledTools: (toolSettings ?? []).map((t: Record<string, unknown>) => ({
       id: t.id as string,
       user_id: t.user_id as string,

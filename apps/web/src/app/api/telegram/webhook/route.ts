@@ -10,7 +10,9 @@ import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 import {
   injectSchedulingDirective,
   injectSchedulingContinuation,
+  injectDateContext,
   rejectAllPendingConfirmations,
+  resolveDateReferences,
   markdownToHtml,
   REJECTION_RE,
 } from "@/lib/message-preprocessing";
@@ -85,9 +87,9 @@ async function answerCallbackQuery(callbackQueryId: string, text: string) {
 }
 
 async function transcribeVoice(fileId: string): Promise<string> {
-  const openaiApiKey = process.env.OPENAI_API_KEY;
-  if (!openaiApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured for voice transcription.");
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) {
+    throw new Error("GEMINI_API_KEY is not configured for voice transcription.");
   }
 
   // Step 1: Get the file path from Telegram
@@ -109,26 +111,45 @@ async function transcribeVoice(fileId: string): Promise<string> {
   }
 
   const audioBuffer = await audioRes.arrayBuffer();
-  const audioBlob = new Blob([audioBuffer], { type: "audio/ogg" });
+  const audioBase64 = Buffer.from(audioBuffer).toString("base64");
 
-  // Step 3: Transcribe with OpenAI Whisper
-  const formData = new FormData();
-  formData.append("file", audioBlob, "voice.ogg");
-  formData.append("model", "whisper-1");
+  // Step 3: Transcribe with Gemini Flash (multimodal)
+  const geminiRes = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                inline_data: {
+                  mime_type: "audio/ogg",
+                  data: audioBase64,
+                },
+              },
+              {
+                text: "Transcribe exactamente lo que dice este audio. Devuelve solo el texto transcrito, sin explicaciones ni comentarios adicionales.",
+              },
+            ],
+          },
+        ],
+      }),
+    }
+  );
 
-  const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${openaiApiKey}` },
-    body: formData,
-  });
-
-  if (!whisperRes.ok) {
-    const err = await whisperRes.text();
-    throw new Error(`Whisper transcription failed: ${whisperRes.status} ${err}`);
+  if (!geminiRes.ok) {
+    const err = await geminiRes.text();
+    throw new Error(`Gemini transcription failed: ${geminiRes.status} ${err}`);
   }
 
-  const whisperData = (await whisperRes.json()) as { text?: string };
-  return whisperData.text?.trim() ?? "";
+  const geminiData = (await geminiRes.json()) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+
+  const transcript = geminiData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+  return transcript;
 }
 
 
@@ -228,8 +249,6 @@ export async function POST(request: Request) {
   } else {
     text = message.text!.trim();
   }
-
-  text = injectSchedulingDirective(text);
 
   const { command, args } = parseBotCommand(text);
 
@@ -369,10 +388,22 @@ export async function POST(request: Request) {
     }
   }
 
-  // If we're in a scheduling conversation, enrich the message with context
-  text = await injectSchedulingContinuation(db, session.id, text);
-
   const runtime = await loadAgentRuntimeContext(db, userId);
+
+  // Preprocessing pipeline — same order as web chat route:
+  // 1. Resolve day names to ISO dates (pure text, no DB)
+  // 2. Scheduling continuation has highest priority — if it modifies the text,
+  //    skip date-context and directive injection to avoid double directives.
+  // 3. Only when NOT in an active scheduling flow: inject date context (for
+  //    availability follow-ups) and the first-message scheduling directive.
+  text = resolveDateReferences(text, runtime.timezone);
+  const afterContinuation = await injectSchedulingContinuation(db, session.id, text);
+  if (afterContinuation !== text) {
+    text = afterContinuation;
+  } else {
+    text = await injectDateContext(db, session.id, text, runtime.timezone);
+    text = injectSchedulingDirective(text);
+  }
 
   try {
     const result = await runAgent({

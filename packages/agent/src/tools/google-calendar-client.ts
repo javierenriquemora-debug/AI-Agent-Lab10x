@@ -54,6 +54,35 @@ function authHeaders(auth: GoogleCalendarAuthContext): Record<string, string> {
   };
 }
 
+/**
+ * Returns the IDs of calendars where the user is owner OR writer.
+ * - owner: calendars the user created (includes primary)
+ * - writer: team/shared calendars where the user's events also live
+ * All-day events (≥23h) are filtered out inside checkCalendarAvailability
+ * to prevent shared holiday/vacation calendars from blocking entire days.
+ * Falls back to ["primary"] on error.
+ */
+export async function listWritableCalendarIds(
+  auth: GoogleCalendarAuthContext
+): Promise<string[]> {
+  try {
+    const response = await fetch(
+      `${CALENDAR_API_BASE}/users/me/calendarList?minAccessRole=writer`,
+      { headers: authHeaders(auth) }
+    );
+    if (!response.ok) return ["primary"];
+    const data = (await response.json()) as {
+      items?: Array<{ id: string; accessRole: string }>;
+    };
+    const ids = (data.items ?? [])
+      .filter((c) => c.accessRole === "owner" || c.accessRole === "writer")
+      .map((c) => c.id);
+    return ids.length > 0 ? ids : ["primary"];
+  } catch {
+    return ["primary"];
+  }
+}
+
 function formatLocalTime(utcString: string, timeZone: string): string {
   return new Date(utcString).toLocaleTimeString("es-CO", {
     timeZone,
@@ -72,6 +101,8 @@ function formatLocalDate(utcString: string, timeZone: string): string {
     day: "numeric",
   });
 }
+
+const MIN_FREE_SLOT_MS = 30 * 60 * 1000; // 30 minutes — hide slots too short to be useful
 
 function computeFreeSlots(
   rangeStartMs: number,
@@ -93,23 +124,23 @@ function computeFreeSlots(
     free.push({ start: cursor, end: rangeEndMs });
   }
 
-  return free;
+  return free.filter((slot) => slot.end - slot.start >= MIN_FREE_SLOT_MS);
 }
+
+const ALL_DAY_THRESHOLD_MS = 23 * 60 * 60 * 1000; // 23 hours — flags all-day / multi-day events
 
 export async function checkCalendarAvailability(
   auth: GoogleCalendarAuthContext,
   timeMin: string,
-  timeMax: string
+  timeMax: string,
+  calendarIds: string[] = ["primary"]
 ): Promise<CheckAvailabilityResult> {
+  const items = calendarIds.map((id) => ({ id }));
+
   const response = await fetch(`${CALENDAR_API_BASE}/freeBusy`, {
     method: "POST",
     headers: authHeaders(auth),
-    body: JSON.stringify({
-      timeMin,
-      timeMax,
-      timeZone: auth.timeZone,
-      items: [{ id: "primary" }],
-    }),
+    body: JSON.stringify({ timeMin, timeMax, timeZone: auth.timeZone, items }),
   });
 
   if (!response.ok) {
@@ -118,10 +149,18 @@ export async function checkCalendarAvailability(
   }
 
   const data = (await response.json()) as {
-    calendars: { primary?: { busy?: Array<{ start: string; end: string }> } };
+    calendars: Record<string, { busy?: Array<{ start: string; end: string }> }>;
   };
 
-  const rawBusy = data.calendars?.primary?.busy ?? [];
+  // Merge busy blocks from all calendars, filtering out all-day / multi-day events
+  // to avoid shared holiday calendars blocking the entire day.
+  const rawBusy: Array<{ start: string; end: string }> = [];
+  for (const calData of Object.values(data.calendars)) {
+    for (const block of calData.busy ?? []) {
+      const duration = new Date(block.end).getTime() - new Date(block.start).getTime();
+      if (duration < ALL_DAY_THRESHOLD_MS) rawBusy.push(block);
+    }
+  }
   const tz = auth.timeZone;
 
   const busyMs = rawBusy.map((b) => ({

@@ -47,14 +47,15 @@ export const SUBJECT_MARKER_RE =
   /\b(asunto|tema|sobre|acerca|revisar|revisión|presentación|propuesta|seguimiento|discutir|entrevista|capacitación|call de|sync de)\b/i;
 
 export const SCHEDULING_FLOW_RE =
-  /Para agendar necesito|Fecha y hora de inicio|asunto de la reuni|¿Cuál es el asunto|¿A qué hora|¿Cuándo|¿Con quién|hora de la reuni|fecha prefieres|qué fecha|qué día|hora de inicio|¿Cuál es la fecha|proporcionarme el (email|correo)|completar el agendamiento|para agendar|para completar/i;
+  /Para agendar necesito|Fecha y hora de inicio|asunto de la reuni|¿Cuál es el asunto|¿A qué hora|¿Cuándo|¿Con quién|hora de la reuni|fecha prefieres|qué fecha|qué día|hora de inicio|¿Cuál es la fecha|proporcionarme el (email|correo)|completar el agendamiento|para agendar|para completar|Confirma si deseas|deseas crear el evento|crear el evento|¿Deseas proceder|deseas agendar/i;
 
 /**
  * Detects when the user is ASKING about a contact/email rather than providing one.
- * e.g. "cual es el correo de X", "sabes el email de Y", "qué correo tiene Z"
+ * e.g. "cual es el correo de X", "sabes el email de Y", "qué correo tiene Z",
+ *      "y el de X?", "el contacto de X", "dame el correo de X"
  */
 export const CONTACT_QUESTION_RE =
-  /\b(cu[aá]l\s+es|sabes|tienes|qu[eé]\s+correo|qu[eé]\s+email|cu[aá]l\s+es\s+el\s+(correo|email))\b/i;
+  /\b(cu[aá]l\s+es|sabes|tienes|qu[eé]\s+correo|qu[eé]\s+email|cu[aá]l\s+es\s+el\s+(correo|email)|el\s+correo\s+de|el\s+email\s+de|el\s+contacto\s+de|dame\s+el\s+(correo|email)|y\s+el\s+de|y\s+la\s+de)\b/i;
 
 /**
  * Detects when the assistant was presenting a list of contact options to choose from.
@@ -70,6 +71,133 @@ export const CONTACT_OPTIONS_RE =
 export const REJECTION_RE =
   /^(no|nop|nope|nel)$|no\s+(quiero|proceder|crear|agendar|gracias)|cancelar?|cancela(r|do)?|olvida(r|lo)?|d[eé]jalo|no\s+lo\s+hagas|no\s+proceed/i;
 
+// ─── Date reference resolver ─────────────────────────────────────────────────
+
+const DAY_DOW: Record<string, number> = {
+  domingo: 0, lunes: 1, martes: 2, miercoles: 3, jueves: 4, viernes: 5, sabado: 6,
+};
+
+function normalizeDayName(s: string): string {
+  return s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+/**
+ * Replaces natural-language day references ("próximo jueves", "el lunes")
+ * with the explicit ISO date so the LLM never has to compute dates itself.
+ *
+ * e.g. "próximo jueves" → "próximo jueves (jueves, 9 de abril de 2026 / 2026-04-09)"
+ */
+export function resolveDateReferences(text: string, timezone: string): string {
+  const todayIso = new Date().toLocaleDateString("en-CA", { timeZone: timezone }); // YYYY-MM-DD
+  const todayDate = new Date(`${todayIso}T12:00:00`);
+  const todayDow = todayDate.getDay();
+
+  return text.replace(
+    /(?:(?:el|para el|el pr[oó]ximo|pr[oó]ximo|este)\s+)?(domingo|lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado)/gi,
+    (match, dayName) => {
+      const key = normalizeDayName(dayName);
+      const targetDow = DAY_DOW[key];
+      if (targetDow === undefined) return match;
+
+      let daysAhead = targetDow - todayDow;
+      if (daysAhead <= 0) daysAhead += 7; // always look forward
+
+      const target = new Date(`${todayIso}T12:00:00`);
+      target.setDate(target.getDate() + daysAhead);
+      const isoDate = target.toLocaleDateString("en-CA", { timeZone: timezone });
+      const label = target.toLocaleDateString("es-CO", {
+        timeZone: timezone, weekday: "long", day: "numeric", month: "long", year: "numeric",
+      });
+
+      return `${match} (${label} / ${isoDate})`;
+    }
+  );
+}
+
+// ─── Date context injection (for follow-up messages without explicit date) ───
+
+const TIME_ONLY_RE = /\b(\d{1,2}\s*(am|pm|a\.m\.|p\.m\.)|a las\s+\d|\d{1,2}:\d{2})\b/i;
+const DATE_ISO_RE = /\b(\d{4}-\d{2}-\d{2})\b/;
+
+/**
+ * Detects if the last assistant message was an availability result
+ * (contains time ranges like "08:00 - 09:00").
+ * Requires spaces around the dash to avoid false-positives with ISO
+ * datetime offsets like "08:00:00-05:00".
+ */
+const AVAILABILITY_RESULT_RE = /\d{2}:\d{2}\s+-\s+\d{2}:\d{2}/;
+
+/**
+ * When a follow-up message has no explicit date/day but either:
+ *  a) contains time-of-day references ("entre 2pm y 6pm"), or
+ *  b) follows an availability result from the assistant ("muéstrame solo los disponibles"),
+ * extract the most recently used ISO date from session history and inject it.
+ * This prevents the LLM from recalculating and getting the wrong date.
+ */
+export async function injectDateContext(
+  db: DbClient,
+  sessionId: string,
+  text: string,
+  timezone: string
+): Promise<string> {
+  if (DAY_REF_RE.test(text)) return text; // already has an explicit date reference
+
+  const hasTimeRef = TIME_ONLY_RE.test(text);
+
+  // Look in recent messages for context
+  const { data: messages } = await db
+    .from("agent_messages")
+    .select("role, content")
+    .eq("session_id", sessionId)
+    .order("created_at", { ascending: false })
+    .limit(6);
+
+  if (!messages || messages.length === 0) return text;
+
+  // Check if last assistant message was an availability result (has HH:MM - HH:MM ranges)
+  const lastAssistant = messages.find((m) => m.role === "assistant");
+  const lastAssistantIsAvailability = AVAILABILITY_RESULT_RE.test(
+    (lastAssistant?.content as string) ?? ""
+  );
+
+  // Only inject if we have a time reference OR we're following an availability response
+  if (!hasTimeRef && !lastAssistantIsAvailability) return text;
+
+  // Compute local timezone offset (e.g. "-05:00")
+  const offsetRaw = new Date().toLocaleString("en-US", { timeZone: timezone, timeZoneName: "shortOffset" })
+    .match(/GMT([+-]\d+(?::\d+)?)/)?.[1] ?? "-5";
+  const offsetSign = offsetRaw.startsWith("-") ? "-" : "+";
+  const [offsetH, offsetM = "0"] = offsetRaw.replace(/[+-]/, "").split(":");
+  const tzOffset = `${offsetSign}${offsetH.padStart(2, "0")}:${offsetM.padStart(2, "0")}`;
+
+  // Find the most recently resolved ISO date in session history
+  for (const msg of messages) {
+    const content = msg.content as string;
+    const match = DATE_ISO_RE.exec(content);
+    if (match) {
+      const isoDate = match[1];
+      const label = new Date(`${isoDate}T12:00:00`).toLocaleDateString("es-CO", {
+        timeZone: timezone, weekday: "long", day: "numeric", month: "long", year: "numeric",
+      });
+
+      // When following an availability result without a time window, force a fresh tool call
+      // so the LLM doesn't recycle stale data from the conversation history.
+      if (lastAssistantIsAvailability && !hasTimeRef) {
+        return (
+          `[INSTRUCCIÓN: El usuario quiere ver SOLO los espacios disponibles para ${label} (${isoDate}). ` +
+          `DEBES llamar calendar_check_availability con time_min="${isoDate}T00:00:00${tzOffset}" ` +
+          `y time_max="${isoDate}T23:59:59${tzOffset}". ` +
+          `NO uses datos de respuestas anteriores del historial.]\n\n${text}`
+        );
+      }
+
+      return `[Fecha de contexto: ${label} / ${isoDate}. Usa esta fecha para construir los rangos de tiempo.]\n\n${text}`;
+    }
+  }
+
+  return text;
+}
+
 // ─── Scheduling directive injection ──────────────────────────────────────────
 
 /**
@@ -82,16 +210,29 @@ export function injectSchedulingDirective(text: string): string {
   const hasPersonName = PERSON_NAME_RE.test(text);
   const hasHour = HOUR_REF_RE.test(text);
   const hasDay = DAY_REF_RE.test(text);
+  const hasSubject = SUBJECT_MARKER_RE.test(text);
 
-  if (hasScheduleIntent && hasDay && hasHour && (hasEmail || hasPersonName)) {
+  if (!hasScheduleIntent) return text;
+
+  // All data present — proceed immediately
+  if (hasDay && hasHour && (hasEmail || hasPersonName)) {
     if (hasEmail) {
       return `[AGENDAMIENTO COMPLETO: fecha/hora, asunto y email presentes. Llama calendar_create_event AHORA sin preguntas.]\n\n${text}`;
     }
     return `[AGENDAMIENTO con nombre de persona. Llama contacts_lookup con los nombres detectados, luego calendar_create_event.]\n\n${text}`;
   }
 
-  if (hasScheduleIntent && (hasEmail || hasPersonName)) {
-    return `[El usuario quiere agendar y ya mencionó participante(s). Pregunta SOLO la fecha, hora de inicio y el asunto. NO pidas participantes.]\n\n${text}`;
+  // Has participant — ask for the FIRST missing piece only (one question at a time)
+  if (hasEmail || hasPersonName) {
+    if (!hasDay) {
+      return `[El usuario quiere agendar con participante(s) ya mencionado(s). Pregunta ÚNICAMENTE: "¿Para qué fecha?" NO pidas hora ni asunto todavía.]\n\n${text}`;
+    }
+    if (!hasHour) {
+      return `[El usuario quiere agendar el ${hasDay ? "día mencionado" : "día indicado"} con participante(s) ya mencionado(s). Pregunta ÚNICAMENTE: "¿A qué hora?" NO pidas asunto todavía.]\n\n${text}`;
+    }
+    if (!hasSubject) {
+      return `[El usuario quiere agendar con participante(s), fecha y hora ya mencionados. Pregunta ÚNICAMENTE: "¿Cuál es el asunto?" NO pidas más datos.]\n\n${text}`;
+    }
   }
 
   return text;
@@ -150,9 +291,18 @@ export async function injectSchedulingContinuation(
   // selecting a contact — NOT requesting an event. Inject an explicit block so
   // the LLM confirms the selection without calling calendar_create_event.
   if (CONTACT_OPTIONS_RE.test(lastAssistantContent)) {
+    // Extract the numbered options from the last assistant message so the LLM
+    // knows exactly which contact each number refers to (avoids old-context confusion).
+    const optionLines = lastAssistantContent.match(/\d+\.\s+[^\n]+/g) ?? [];
+    const optionsText =
+      optionLines.length > 0
+        ? `Las opciones presentadas fueron:\n${optionLines.map((l) => `  ${l}`).join("\n")}\n`
+        : "";
     return (
       `[El usuario está eligiendo un contacto de la lista presentada. ` +
-      `Confirma cuál eligió y pregunta si desea hacer algo más. ` +
+      `${optionsText}` +
+      `Confirma cuál eligió (el número que escribió corresponde EXACTAMENTE a esa lista, ignora cualquier contacto de conversaciones anteriores) ` +
+      `y pregunta si desea hacer algo más. ` +
       `NO llames calendar_create_event a menos que el usuario lo pida explícitamente ahora.]\n\n${text}`
     );
   }
@@ -175,8 +325,15 @@ export async function injectSchedulingContinuation(
 
   // ── 5. Not in a scheduling flow → safe to pass through ───────────────────
   if (!SCHEDULING_FLOW_RE.test(lastAssistantContent)) {
-    // Contact question outside any flow — no directive needed
-    if (CONTACT_QUESTION_RE.test(text)) return text;
+    // Contact question outside any flow — force a fresh tool call, never use history
+    if (CONTACT_QUESTION_RE.test(text)) {
+      return (
+        `[CONSULTA DE CONTACTO INFORMATIVA (fuera de flujo de agendamiento). ` +
+        `Llama contacts_lookup AHORA. NUNCA uses datos del historial — busca siempre fresco. ` +
+        `Si hay UN resultado: muéstralo directamente. ` +
+        `Si hay MÚLTIPLES resultados: listarlos TODOS numerados y NO pidas confirmación ni preguntes cuál usar.]\n\n${text}`
+      );
+    }
     return text;
   }
 
@@ -244,12 +401,28 @@ export async function injectSchedulingContinuation(
 
   if (missing.length === 0) {
     const emailsList = [...allFlowEmails].join(", ");
+
+    // If we have all scheduling data but no confirmed email yet, resolve the contact first.
+    if (allFlowEmails.size === 0) {
+      // Extract person names mentioned after "con" or "invita" in the flow
+      const nameMatches = flowContent.match(/\b(?:con|invita?)\s+([a-záéíóúñA-ZÁÉÍÓÚÑ]{2,}(?:\s+[a-záéíóúñA-ZÁÉÍÓÚÑ]{2,})?)/gi) ?? [];
+      const names = nameMatches.map((m) => m.replace(/^(?:con|invita?)\s+/i, "").trim()).join(", ");
+      return (
+        `[CONTINUACIÓN DE AGENDAMIENTO.\n` +
+        `Mensajes de este flujo:\n${prevUserSummary}\n` +
+        `Mensaje actual: "${text}"\n` +
+        `INSTRUCCIÓN: Ya tienes fecha, hora y asunto. FALTA el email del participante. ` +
+        `LLAMA contacts_lookup para buscar: ${names || "el participante mencionado"}. ` +
+        `Una vez tengas el email, llama calendar_create_event con todos los datos.]\n\n${text}`
+      );
+    }
+
     return (
       `[CONTINUACIÓN DE AGENDAMIENTO.\n` +
       `Mensajes de este flujo:\n${prevUserSummary}\n` +
       `Mensaje actual: "${text}"\n` +
       `Emails confirmados: ${emailsList}\n` +
-      `INSTRUCCIÓN: Ya tienes TODOS los datos. NO llames contacts_lookup de nuevo. ` +
+      `INSTRUCCIÓN: Ya tienes TODOS los datos incluyendo email. NO llames contacts_lookup de nuevo. ` +
       `Llama calendar_create_event AHORA usando EXACTAMENTE estos emails: [${emailsList}]]\n\n${text}`
     );
   }

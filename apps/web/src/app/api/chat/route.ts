@@ -6,7 +6,9 @@ import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 import {
   injectSchedulingDirective,
   injectSchedulingContinuation,
+  injectDateContext,
   rejectAllPendingConfirmations,
+  resolveDateReferences,
   REJECTION_RE,
 } from "@/lib/message-preprocessing";
 
@@ -66,8 +68,22 @@ export async function POST(request: Request) {
       }
     }
 
-    let processedMessage = injectSchedulingDirective(message);
-    processedMessage = await injectSchedulingContinuation(db, session.id, processedMessage);
+    // Preprocessing pipeline (order matters):
+    // 1. Resolve day names to ISO dates (pure text, no DB)
+    // 2. Scheduling continuation has highest priority — if it modifies the text,
+    //    skip date-context and directive injection to avoid double directives.
+    // 3. Only when NOT in an active scheduling flow: inject date context (for
+    //    availability follow-ups) and the first-message scheduling directive.
+    let processedMessage = resolveDateReferences(message, runtime.timezone);
+    const afterContinuation = await injectSchedulingContinuation(db, session.id, processedMessage);
+    if (afterContinuation !== processedMessage) {
+      // Active scheduling flow — continuation directive takes precedence
+      processedMessage = afterContinuation;
+    } else {
+      // No active scheduling flow — apply availability date context then directive
+      processedMessage = await injectDateContext(db, session.id, processedMessage, runtime.timezone);
+      processedMessage = injectSchedulingDirective(processedMessage);
+    }
 
     const result = await runAgent({
       message: processedMessage,

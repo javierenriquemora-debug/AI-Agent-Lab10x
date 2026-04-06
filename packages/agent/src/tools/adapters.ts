@@ -236,10 +236,10 @@ async function executeGoogleCalendarTool(
 
     const summary = results.map((r) => {
       if (r.totalFound === 0) {
-        return { name: r.query, found: false, emails: [] as string[], resolvedEmail: null as string | null, message: `No se encontro "${r.query}" en los contactos.` };
+        return { name: r.query, found: false, emails: [] as string[], resolvedEmail: null as string | null, multiple: false, contacts: [] as { name: string; email: string }[] };
       }
       if (r.totalFound === 1) {
-        return { name: r.found[0].name, found: true, emails: r.found[0].emails, resolvedEmail: r.found[0].emails[0], message: `${r.found[0].name}: ${r.found[0].emails[0]}` };
+        return { name: r.found[0].name, found: true, multiple: false, emails: r.found[0].emails, resolvedEmail: r.found[0].emails[0], contacts: [{ name: r.found[0].name, email: r.found[0].emails[0] }] };
       }
       return {
         name: r.query,
@@ -248,19 +248,28 @@ async function executeGoogleCalendarTool(
         emails: r.found.flatMap((c) => c.emails),
         resolvedEmail: null as string | null,
         contacts: r.found.map((c) => ({ name: c.name, email: c.emails[0] })),
-        message: `Multiples resultados para "${r.query}": ${r.found.map((c) => `${c.name} (${c.emails[0]})`).join(", ")}. Confirma cual es el correcto.`,
       };
     });
 
-    const resolved = summary.filter((s) => s.found && s.resolvedEmail).map((s) => `${s.name}: ${s.resolvedEmail}`);
-    const notFound = summary.filter((s) => !s.found).map((s) => s.name);
-    const needsConfirm = summary.filter((s) => s.found && !s.resolvedEmail).map((s) => s.message);
-
     let message = "";
-    if (resolved.length > 0) message += `Emails resueltos:\n${resolved.map((r) => `- ${r}`).join("\n")}\n`;
-    if (needsConfirm.length > 0) message += `\nAmbiguos (pide confirmacion):\n${needsConfirm.join("\n")}\n`;
-    if (notFound.length > 0) message += `\nNo encontrados: ${notFound.join(", ")}. Pide su email al usuario.\n`;
-    message += `\nIMPORTANTE: Al crear el evento incluye TODOS los emails resueltos: ${summary.filter((s) => s.resolvedEmail).map((s) => s.resolvedEmail).join(", ")}`;
+
+    for (const s of summary) {
+      if (!s.found) {
+        message += `No se encontró "${s.name}" en los contactos. Pide su email al usuario.\n`;
+      } else if (!s.multiple) {
+        message += `${s.name}: ${s.resolvedEmail}\n`;
+      } else {
+        // Multiple results — list all of them. The system prompt rules decide whether
+        // to ask the user to pick one (scheduling flow) or just display all (informational).
+        const list = s.contacts.map((c, i) => `${i + 1}. ${c.name} - ${c.email}`).join("\n");
+        message += `Múltiples resultados para "${s.name}":\n${list}\n`;
+      }
+    }
+
+    const resolvedEmails = summary.filter((s) => s.resolvedEmail).map((s) => s.resolvedEmail);
+    if (resolvedEmails.length > 0) {
+      message += `\nIMPORTANTE: Al crear el evento incluye TODOS los emails resueltos: ${resolvedEmails.join(", ")}`;
+    }
 
     return { message: message.trim(), contacts: summary };
   }
@@ -268,13 +277,43 @@ async function executeGoogleCalendarTool(
   if (toolName === "calendar_check_availability") {
     const input = calendarCheckAvailabilitySchema.parse(rawInput);
 
+    // Normalize an ISO string to the user's local timezone while preserving the
+    // actual requested time (not expanding to full day). This corrects off-by-hours
+    // errors when the LLM sends UTC times, while still respecting time windows like "2pm-6pm".
+    const getLocalOffset = (tz: string): string => {
+      const offsetRaw = new Date().toLocaleString("en-US", { timeZone: tz, timeZoneName: "shortOffset" })
+        .match(/GMT([+-]\d+(?::\d+)?)/)?.[1] ?? "-5";
+      const sign = offsetRaw.startsWith("-") ? "-" : "+";
+      const [h, m = "0"] = offsetRaw.replace(/[+-]/, "").split(":");
+      return `${sign}${h.padStart(2, "0")}:${m.padStart(2, "0")}`;
+    };
+
+    const normalizeToLocalTime = (isoStr: string, tz: string): string => {
+      const offset = getLocalOffset(tz);
+      // Date-only strings (YYYY-MM-DD) must be treated as midnight local, not UTC midnight.
+      if (/^\d{4}-\d{2}-\d{2}$/.test(isoStr)) return `${isoStr}T00:00:00${offset}`;
+      const date = new Date(isoStr);
+      const localDate = date.toLocaleDateString("en-CA", { timeZone: tz }); // "YYYY-MM-DD"
+      const [hh, mm, ss] = date.toLocaleTimeString("en-US", {
+        timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit",
+      }).split(":").map((v) => v.padStart(2, "0"));
+      return `${localDate}T${hh}:${mm}:${ss}${offset}`;
+    };
+
+    const normalizedMin = normalizeToLocalTime(input.time_min, google.timeZone);
+    const normalizedMax = normalizeToLocalTime(input.time_max, google.timeZone);
+    const extraRanges = (input.extra_ranges ?? []).map((r) => ({
+      time_min: normalizeToLocalTime(r.time_min, google.timeZone),
+      time_max: normalizeToLocalTime(r.time_max, google.timeZone),
+    }));
+
     const allRanges = [
-      { time_min: input.time_min, time_max: input.time_max },
-      ...(input.extra_ranges ?? []),
+      { time_min: normalizedMin, time_max: normalizedMax },
+      ...extraRanges,
     ];
 
     const results = await Promise.all(
-      allRanges.map((r) => checkCalendarAvailability(google, r.time_min, r.time_max))
+      allRanges.map((r) => checkCalendarAvailability(google, r.time_min, r.time_max, ["primary"]))
     );
 
     const combined = results.map((r, i) => ({

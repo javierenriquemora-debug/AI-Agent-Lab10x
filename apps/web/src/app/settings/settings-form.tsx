@@ -17,6 +17,7 @@ interface Props {
 const TOOL_IDS = [
   "get_user_preferences",
   "list_enabled_tools",
+  "bash",
   "github_list_repos",
   "github_list_issues",
   "github_create_issue",

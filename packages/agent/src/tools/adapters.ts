@@ -2,7 +2,7 @@ import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { DbClient } from "@agents/db";
 import type { ToolCall, UserIntegration, UserToolSetting } from "@agents/types";
-import { TOOL_CATALOG, toolRequiresConfirmation } from "./catalog";
+import { TOOL_CATALOG } from "./catalog";
 import { createToolCall, getToolCallById, updateToolCallStatus } from "@agents/db";
 import {
   createGithubIssue,
@@ -18,6 +18,7 @@ import {
   type GoogleCalendarAuthContext,
 } from "./google-calendar-client";
 import { searchContacts } from "./google-contacts-client";
+import { executeTerminalCommand } from "./terminal-session-manager";
 
 export interface PendingConfirmation {
   toolCallId: string;
@@ -30,9 +31,11 @@ interface ToolExecutionResult {
   [key: string]: unknown;
 }
 
-interface PendingToolExecutionResult {
-  __type: "pending_confirmation";
-  pendingConfirmation: PendingConfirmation;
+export interface PendingToolReview {
+  toolName: string;
+  input: Record<string, unknown>;
+  message: string;
+  allowedDecisions: Array<"approve" | "reject">;
 }
 
 export interface IntegrationSecrets {
@@ -107,6 +110,15 @@ const githubCreateRepoSchema = z.object({
   private: z.boolean().optional().default(true),
 });
 
+const bashToolSchema = z.object({
+  terminal: z
+    .string()
+    .min(1)
+    .default("default")
+    .describe('Persistent terminal session name to reuse or create. If omitted, use "default".'),
+  prompt: z.string().min(1).describe("Command text to execute inside the selected terminal"),
+});
+
 function isToolAvailable(
   toolId: string,
   ctx: ToolContext
@@ -138,30 +150,6 @@ function getGoogleAuth(ctx: ToolContext): GoogleCalendarAuthContext {
     throw new Error("Google Calendar integration is not available for this user.");
   }
   return google;
-}
-
-function toPendingToolResult(pendingConfirmation: PendingConfirmation): string {
-  return JSON.stringify({
-    __type: "pending_confirmation",
-    pendingConfirmation,
-  } satisfies PendingToolExecutionResult);
-}
-
-export function getPendingConfirmationFromToolResult(result: unknown): PendingConfirmation | null {
-  if (typeof result !== "string") {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(result) as PendingToolExecutionResult;
-    if (parsed.__type === "pending_confirmation" && parsed.pendingConfirmation?.toolCallId) {
-      return parsed.pendingConfirmation;
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
 }
 
 async function executeGithubTool(
@@ -363,11 +351,35 @@ async function executeGoogleCalendarTool(
   throw new Error(`Unsupported calendar tool: ${toolName}`);
 }
 
+async function executeBashTool(
+  rawInput: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolExecutionResult> {
+  const input = bashToolSchema.parse(rawInput);
+  const result = await executeTerminalCommand(ctx.userId, input.terminal, input.prompt);
+
+  return {
+    message: result.timedOut
+      ? `El comando en el terminal "${result.terminal}" excedió el tiempo límite.`
+      : `Comando ejecutado en el terminal "${result.terminal}".`,
+    terminal: result.terminal,
+    shell: result.shell,
+    prompt: result.prompt,
+    output: result.output,
+    timedOut: result.timedOut,
+    truncated: result.truncated,
+    exitCode: result.exitCode,
+  };
+}
+
 function routeToolExecution(
   toolName: string,
   input: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolExecutionResult> {
+  if (toolName === "bash") {
+    return executeBashTool(input, ctx);
+  }
   if (toolName.startsWith("calendar_") || toolName === "contacts_lookup") {
     return executeGoogleCalendarTool(toolName, input, ctx);
   }
@@ -392,46 +404,102 @@ async function executeImmediateTool(
   }
 }
 
-async function createPendingConfirmation(
+export function buildPendingToolReview(
   toolName: string,
-  input: Record<string, unknown>,
-  ctx: ToolContext
-): Promise<string> {
-  const record = await createToolCall(ctx.db, ctx.sessionId, toolName, input, true);
-
+  input: Record<string, unknown>
+): PendingToolReview {
   if (toolName === "github_create_issue") {
     const parsed = githubCreateIssueSchema.parse(input);
-    return toPendingToolResult({
-      toolCallId: record.id,
+    return {
       toolName,
+      input,
       message: `Confirma si deseas crear el issue "${parsed.title}" en ${parsed.owner}/${parsed.repo}.`,
-    });
+      allowedDecisions: ["approve", "reject"],
+    };
   }
 
   if (toolName === "github_create_repo") {
     const parsed = githubCreateRepoSchema.parse(input);
-    return toPendingToolResult({
-      toolCallId: record.id,
+    return {
       toolName,
+      input,
       message: `Confirma si deseas crear el repositorio "${parsed.name}".`,
-    });
+      allowedDecisions: ["approve", "reject"],
+    };
   }
 
   if (toolName === "calendar_create_event") {
     const parsed = calendarCreateEventSchema.parse(input);
-    return toPendingToolResult({
-      toolCallId: record.id,
+    return {
       toolName,
+      input,
       message: `Confirma si deseas crear el evento "${parsed.summary}" el ${parsed.start_date_time}.`,
-    });
+      allowedDecisions: ["approve", "reject"],
+    };
   }
 
-  throw new Error(`Pending confirmation is not supported for ${toolName}`);
+  if (toolName === "calendar_list_events") {
+    const parsed = calendarListEventsSchema.parse(input);
+    return {
+      toolName,
+      input,
+      message: `Confirma si deseas consultar los eventos entre ${parsed.time_min} y ${parsed.time_max}.`,
+      allowedDecisions: ["approve", "reject"],
+    };
+  }
+
+  if (toolName === "calendar_check_availability") {
+    const parsed = calendarCheckAvailabilitySchema.parse(input);
+    return {
+      toolName,
+      input,
+      message: `Confirma si deseas consultar la disponibilidad entre ${parsed.time_min} y ${parsed.time_max}.`,
+      allowedDecisions: ["approve", "reject"],
+    };
+  }
+
+  if (toolName === "bash") {
+    const parsed = bashToolSchema.parse(input);
+    const promptPreview =
+      parsed.prompt.length > 160
+        ? `${parsed.prompt.slice(0, 160)}...`
+        : parsed.prompt;
+    const terminalMessage =
+      parsed.terminal === "default"
+        ? "Confirma si deseas ejecutar este comando."
+        : `Confirma si deseas ejecutar el comando en el terminal "${parsed.terminal}".`;
+    return {
+      toolName,
+      input,
+      message: `${terminalMessage} Comando: ${promptPreview}`,
+      allowedDecisions: ["approve", "reject"],
+    };
+  }
+
+  return {
+    toolName,
+    input,
+    message: `Confirma si deseas ejecutar la acción "${toolName}".`,
+    allowedDecisions: ["approve", "reject"],
+  };
+}
+
+export async function createPendingToolCallRecord(
+  ctx: ToolContext,
+  review: PendingToolReview
+): Promise<PendingConfirmation> {
+  const record = await createToolCall(ctx.db, ctx.sessionId, review.toolName, review.input, true);
+  return {
+    toolCallId: record.id,
+    toolName: review.toolName,
+    message: review.message,
+  };
 }
 
 export async function executeToolCallById(
   ctx: ToolContext,
-  toolCallId: string
+  toolCallId: string,
+  inputOverride?: Record<string, unknown>
 ): Promise<{ toolCall: ToolCall; result: ToolExecutionResult }> {
   const toolCall = await getToolCallById(ctx.db, toolCallId);
   if (!toolCall) {
@@ -443,7 +511,11 @@ export async function executeToolCallById(
   }
 
   try {
-    const result = await routeToolExecution(toolCall.tool_name, toolCall.arguments_json, ctx);
+    const result = await routeToolExecution(
+      toolCall.tool_name,
+      inputOverride ?? toolCall.arguments_json,
+      ctx
+    );
     await updateToolCallStatus(ctx.db, toolCall.id, "executed", result);
     return { toolCall, result };
   } catch (error) {
@@ -455,6 +527,20 @@ export async function executeToolCallById(
 
 export function buildLangChainTools(ctx: ToolContext) {
   const tools = [];
+
+  if (isToolAvailable("bash", ctx)) {
+    tools.push(
+      tool(
+        async (input) => executeImmediateTool("bash", input, ctx),
+        {
+          name: "bash",
+          description:
+            "Executes system commands in a persistent terminal session identified by name and returns the terminal text output. The real shell depends on the host OS.",
+          schema: bashToolSchema,
+        }
+      )
+    );
+  }
 
   if (isToolAvailable("get_user_preferences", ctx)) {
     tools.push(
@@ -525,13 +611,7 @@ export function buildLangChainTools(ctx: ToolContext) {
   if (isToolAvailable("github_create_issue", ctx)) {
     tools.push(
       tool(
-        async (input) => {
-          const needsConfirm = toolRequiresConfirmation("github_create_issue");
-          if (needsConfirm) {
-            return createPendingConfirmation("github_create_issue", input, ctx);
-          }
-          return executeImmediateTool("github_create_issue", input, ctx);
-        },
+        async (input) => executeImmediateTool("github_create_issue", input, ctx),
         {
           name: "github_create_issue",
           description: "Creates a new issue in a GitHub repository. Requires confirmation.",
@@ -544,13 +624,7 @@ export function buildLangChainTools(ctx: ToolContext) {
   if (isToolAvailable("github_create_repo", ctx)) {
     tools.push(
       tool(
-        async (input) => {
-          const needsConfirm = toolRequiresConfirmation("github_create_repo");
-          if (needsConfirm) {
-            return createPendingConfirmation("github_create_repo", input, ctx);
-          }
-          return executeImmediateTool("github_create_repo", input, ctx);
-        },
+        async (input) => executeImmediateTool("github_create_repo", input, ctx),
         {
           name: "github_create_repo",
           description: "Creates a new GitHub repository. Requires confirmation.",
@@ -604,13 +678,7 @@ export function buildLangChainTools(ctx: ToolContext) {
   if (isToolAvailable("calendar_create_event", ctx)) {
     tools.push(
       tool(
-        async (input) => {
-          const needsConfirm = toolRequiresConfirmation("calendar_create_event");
-          if (needsConfirm) {
-            return createPendingConfirmation("calendar_create_event", input, ctx);
-          }
-          return executeImmediateTool("calendar_create_event", input, ctx);
-        },
+        async (input) => executeImmediateTool("calendar_create_event", input, ctx),
         {
           name: "calendar_create_event",
           description:

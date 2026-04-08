@@ -16,6 +16,27 @@ export const TOOL_CATALOG: ToolDefinition[] = [
     parameters_schema: { type: "object", properties: {}, required: [] },
   },
   {
+    id: "bash",
+    name: "bash",
+    description:
+      'Executes system commands in a persistent terminal session identified by name and returns the terminal text output. If terminal is omitted, use "default". The real shell depends on the host OS.',
+    risk: "high",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        terminal: {
+          type: "string",
+          description: 'Persistent terminal session name to reuse or create. Defaults to "default"',
+        },
+        prompt: {
+          type: "string",
+          description: "Command text to execute inside the selected terminal session",
+        },
+      },
+      required: ["prompt"],
+    },
+  },
+  {
     id: "github_list_repos",
     name: "github_list_repos",
     description: "Lists the user's GitHub repositories.",

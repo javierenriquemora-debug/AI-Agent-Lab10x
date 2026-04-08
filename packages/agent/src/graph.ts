@@ -1,8 +1,9 @@
-import { StateGraph, Annotation, MemorySaver } from "@langchain/langgraph";
+import { StateGraph, Annotation, MemorySaver, Command, interrupt } from "@langchain/langgraph";
 import {
   HumanMessage,
   AIMessage,
   SystemMessage,
+  ToolMessage,
   type BaseMessage,
 } from "@langchain/core/messages";
 import type { DbClient } from "@agents/db";
@@ -10,11 +11,15 @@ import type { UserToolSetting, UserIntegration } from "@agents/types";
 import { createChatModel } from "./model";
 import {
   buildLangChainTools,
-  getPendingConfirmationFromToolResult,
+  buildPendingToolReview,
+  createPendingToolCallRecord,
+  executeToolCallById,
   type IntegrationSecrets,
   type PendingConfirmation,
+  type PendingToolReview,
 } from "./tools/adapters";
 import { getSessionMessages, addMessage } from "@agents/db";
+import { toolRequiresConfirmation } from "./tools/catalog";
 
 const GraphState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -24,11 +29,18 @@ const GraphState = Annotation.Root({
   sessionId: Annotation<string>(),
   userId: Annotation<string>(),
   systemPrompt: Annotation<string>(),
-  pendingConfirmation: Annotation<PendingConfirmation | null>({
-    reducer: (_prev, next) => next,
-    default: () => null,
+  processedToolCallIds: Annotation<string[]>({
+    reducer: (prev, next) => [...new Set([...prev, ...next])],
+    default: () => [],
   }),
 });
+
+const sharedCheckpointer = new MemorySaver();
+
+type ResumeDecision =
+  | { type: "approve"; toolCallId: string }
+  | { type: "reject"; message?: string }
+  | { type: "edit"; toolCallId: string; editedArgs: Record<string, unknown> };
 
 export interface AgentInput {
   message: string;
@@ -49,13 +61,139 @@ export interface AgentOutput {
 
 const MAX_TOOL_ITERATIONS = 6;
 
-export async function runAgent(input: AgentInput): Promise<AgentOutput> {
+function getLastAiMessageWithToolCalls(
+  state: typeof GraphState.State
+): AIMessage | null {
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    const msg = state.messages[i];
+    if (msg instanceof AIMessage && msg.tool_calls?.length) {
+      return msg;
+    }
+  }
+  return null;
+}
+
+function getToolCallKey(
+  toolCall: { id?: string; name: string },
+  index: number
+): string {
+  return toolCall.id ?? `${toolCall.name}:${index}`;
+}
+
+function getNextToolCall(
+  state: typeof GraphState.State
+): { key: string; id?: string; name: string; args: Record<string, unknown> } | null {
+  const aiMessage = getLastAiMessageWithToolCalls(state);
+  if (!aiMessage?.tool_calls?.length) return null;
+  for (const [index, tc] of aiMessage.tool_calls.entries()) {
+    const key = getToolCallKey(tc, index);
+    if (!state.processedToolCallIds.includes(key)) {
+      return { key, id: tc.id, name: tc.name, args: tc.args };
+    }
+  }
+  return null;
+}
+
+function getInterruptedReview(
+  result: unknown
+): PendingToolReview | null {
+  const interruptValue = (result as { __interrupt__?: Array<{ value?: unknown }> })?.__interrupt__?.[0]?.value;
+  if (!interruptValue || typeof interruptValue !== "object") return null;
+
+  const review = interruptValue as Partial<PendingToolReview>;
+  if (
+    typeof review.toolName === "string" &&
+    review.input &&
+    typeof review.message === "string"
+  ) {
+    return {
+      toolName: review.toolName,
+      input: review.input as Record<string, unknown>,
+      message: review.message,
+      allowedDecisions: review.allowedDecisions ?? ["approve", "reject"],
+    };
+  }
+
+  return null;
+}
+
+function getInterruptedReviewFromSnapshot(
+  snapshot: unknown
+): PendingToolReview | null {
+  const tasks = (snapshot as {
+    tasks?: Array<{ interrupts?: Array<{ value?: unknown }> }>;
+  })?.tasks;
+
+  if (!tasks?.length) return null;
+
+  for (const task of tasks) {
+    for (const interruptInfo of task.interrupts ?? []) {
+      const value = interruptInfo?.value;
+      if (!value || typeof value !== "object") continue;
+
+      const review = value as Partial<PendingToolReview>;
+      if (
+        typeof review.toolName === "string" &&
+        review.input &&
+        typeof review.message === "string"
+      ) {
+        return {
+          toolName: review.toolName,
+          input: review.input as Record<string, unknown>,
+          message: review.message,
+          allowedDecisions: review.allowedDecisions ?? ["approve", "reject"],
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function persistPendingConfirmation(
+  input: AgentInput,
+  review: PendingToolReview
+): Promise<PendingConfirmation> {
+  const pendingConfirmation = await createPendingToolCallRecord(
+    {
+      db: input.db,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      enabledTools: input.enabledTools,
+      integrations: input.integrations,
+      integrationSecrets: input.integrationSecrets,
+    },
+    review
+  );
+
+  await addMessage(input.db, input.sessionId, "assistant", pendingConfirmation.message, {
+    tool_call_id: pendingConfirmation.toolCallId,
+    structured_payload: {
+      type: "pending_confirmation",
+      ...pendingConfirmation,
+      allowedDecisions: review.allowedDecisions,
+      input: review.input,
+    },
+  });
+
+  return pendingConfirmation;
+}
+
+function getResponseText(lastMessage: BaseMessage): string {
+  return typeof lastMessage.content === "string"
+    ? lastMessage.content
+    : JSON.stringify(lastMessage.content);
+}
+
+async function invokeGraph(
+  input: AgentInput,
+  invocationInput: { messages: BaseMessage[]; sessionId: string; userId: string; systemPrompt: string; processedToolCallIds: string[] } | Command
+): Promise<AgentOutput> {
   const {
-    message,
+    db,
     userId,
     sessionId,
     systemPrompt,
-    db,
     enabledTools,
     integrations,
     integrationSecrets,
@@ -72,16 +210,6 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
   });
 
   const modelWithTools = lcTools.length > 0 ? model.bindTools(lcTools) : model;
-
-  const history = await getSessionMessages(db, sessionId, 30);
-  const priorMessages: BaseMessage[] = history.map((m) => {
-    if (m.role === "user") return new HumanMessage(m.content);
-    if (m.role === "assistant") return new AIMessage(m.content);
-    return new HumanMessage(m.content);
-  });
-
-  await addMessage(db, sessionId, "user", message);
-
   const toolCallNames: string[] = [];
 
   async function agentNode(
@@ -94,32 +222,77 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
   async function toolExecutorNode(
     state: typeof GraphState.State
   ): Promise<Partial<typeof GraphState.State>> {
-    const lastMsg = state.messages[state.messages.length - 1];
-    if (!(lastMsg instanceof AIMessage) || !lastMsg.tool_calls?.length) {
+    const nextToolCall = getNextToolCall(state);
+    if (!nextToolCall) {
       return {};
     }
 
-    const { ToolMessage } = await import("@langchain/core/messages");
-    const results: BaseMessage[] = [];
-    for (const tc of lastMsg.tool_calls) {
-      const matchingTool = lcTools.find((t) => t.name === tc.name);
-      toolCallNames.push(tc.name);
-      if (matchingTool) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result = await (matchingTool as any).invoke(tc.args);
-        const pendingConfirmation = getPendingConfirmationFromToolResult(result);
-        if (pendingConfirmation) {
-          return { pendingConfirmation };
-        }
-        results.push(new ToolMessage({ content: String(result), tool_call_id: tc.id! }));
-      }
+    const matchingTool = lcTools.find((t) => t.name === nextToolCall.name);
+    if (!matchingTool) {
+      return { processedToolCallIds: [nextToolCall.key] };
     }
-    return { messages: results };
+
+    toolCallNames.push(nextToolCall.name);
+
+    if (toolRequiresConfirmation(nextToolCall.name)) {
+      const review = buildPendingToolReview(nextToolCall.name, nextToolCall.args);
+      const decision = interrupt(review) as ResumeDecision;
+
+      if (decision.type === "reject") {
+        return {
+          messages: [
+            new ToolMessage({
+              content: JSON.stringify({
+                message: decision.message ?? "Acción cancelada por el usuario.",
+                rejected: true,
+              }),
+              tool_call_id: nextToolCall.id ?? nextToolCall.key,
+            }),
+          ],
+          processedToolCallIds: [nextToolCall.key],
+        };
+      }
+
+      const execution = await executeToolCallById(
+        {
+          db,
+          userId,
+          sessionId,
+          enabledTools,
+          integrations,
+          integrationSecrets,
+        },
+        decision.toolCallId,
+        decision.type === "edit" ? decision.editedArgs : undefined
+      );
+
+      return {
+        messages: [
+          new ToolMessage({
+            content: JSON.stringify(execution.result),
+              tool_call_id: nextToolCall.id ?? nextToolCall.key,
+          }),
+        ],
+          processedToolCallIds: [nextToolCall.key],
+      };
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await (matchingTool as any).invoke(nextToolCall.args);
+    return {
+      messages: [
+        new ToolMessage({
+          content: String(result),
+          tool_call_id: nextToolCall.id ?? nextToolCall.key,
+        }),
+      ],
+      processedToolCallIds: [nextToolCall.key],
+    };
   }
 
   function shouldContinue(state: typeof GraphState.State): string {
-    const lastMsg = state.messages[state.messages.length - 1];
-    if (lastMsg instanceof AIMessage && lastMsg.tool_calls?.length) {
+    const nextToolCall = getNextToolCall(state);
+    if (nextToolCall) {
       const iterations = state.messages.filter(
         (m) => m instanceof AIMessage && (m as AIMessage).tool_calls?.length
       ).length;
@@ -127,6 +300,10 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
       return "tools";
     }
     return "end";
+  }
+
+  function afterTools(state: typeof GraphState.State): string {
+    return getNextToolCall(state) ? "tools" : "agent";
   }
 
   const graph = new StateGraph(GraphState)
@@ -137,15 +314,52 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
       tools: "tools",
       end: "__end__",
     })
-    .addConditionalEdges("tools", (state) => {
-      return state.pendingConfirmation ? "end" : "agent";
-    }, {
-      end: "__end__",
+    .addConditionalEdges("tools", afterTools, {
+      tools: "tools",
       agent: "agent",
     });
 
-  const checkpointer = new MemorySaver();
-  const app = graph.compile({ checkpointer });
+  const app = graph.compile({ checkpointer: sharedCheckpointer });
+  const finalState = await app.invoke(invocationInput, {
+    configurable: { thread_id: sessionId },
+  });
+  const snapshot = await app.getState({
+    configurable: { thread_id: sessionId },
+  });
+
+  const interruptedReview =
+    getInterruptedReviewFromSnapshot(snapshot) ?? getInterruptedReview(finalState);
+  if (interruptedReview) {
+    const pendingConfirmation = await persistPendingConfirmation(input, interruptedReview);
+    return {
+      response: null,
+      toolCalls: toolCallNames,
+      pendingConfirmation,
+    };
+  }
+
+  const lastMessage = finalState.messages[finalState.messages.length - 1];
+  const responseText = getResponseText(lastMessage);
+  await addMessage(db, sessionId, "assistant", responseText);
+  return { response: responseText, toolCalls: toolCallNames, pendingConfirmation: null };
+}
+
+export async function runAgent(input: AgentInput): Promise<AgentOutput> {
+  const {
+    message,
+    sessionId,
+    systemPrompt,
+    db,
+  } = input;
+
+  const history = await getSessionMessages(db, sessionId, 30);
+  const priorMessages: BaseMessage[] = history.map((m) => {
+    if (m.role === "user") return new HumanMessage(m.content);
+    if (m.role === "assistant") return new AIMessage(m.content);
+    return new HumanMessage(m.content);
+  });
+
+  await addMessage(db, sessionId, "user", message);
 
   const initialMessages: BaseMessage[] = [
     new SystemMessage(systemPrompt),
@@ -153,34 +367,18 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     new HumanMessage(message),
   ];
 
-  const finalState = await app.invoke(
-    { messages: initialMessages, sessionId, userId, systemPrompt, pendingConfirmation: null },
-    { configurable: { thread_id: sessionId } }
-  );
+  return invokeGraph(input, {
+    messages: initialMessages,
+    sessionId: input.sessionId,
+    userId: input.userId,
+    systemPrompt: input.systemPrompt,
+    processedToolCallIds: [],
+  });
+}
 
-  if (finalState.pendingConfirmation) {
-    await addMessage(db, sessionId, "assistant", finalState.pendingConfirmation.message, {
-      tool_call_id: finalState.pendingConfirmation.toolCallId,
-      structured_payload: {
-        type: "pending_confirmation",
-        ...finalState.pendingConfirmation,
-      },
-    });
-
-    return {
-      response: null,
-      toolCalls: toolCallNames,
-      pendingConfirmation: finalState.pendingConfirmation,
-    };
-  }
-
-  const lastMessage = finalState.messages[finalState.messages.length - 1];
-  const responseText =
-    typeof lastMessage.content === "string"
-      ? lastMessage.content
-      : JSON.stringify(lastMessage.content);
-
-  await addMessage(db, sessionId, "assistant", responseText);
-
-  return { response: responseText, toolCalls: toolCallNames, pendingConfirmation: null };
+export async function resumeAgent(
+  input: AgentInput,
+  decision: ResumeDecision
+): Promise<AgentOutput> {
+  return invokeGraph(input, new Command({ resume: decision }));
 }

@@ -6,7 +6,7 @@ import {
   getToolCallById,
   rejectToolCall,
 } from "@agents/db";
-import { executeToolCallById } from "@agents/agent";
+import { resumeAgent } from "@agents/agent";
 import { createClient } from "@/lib/supabase/server";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 
@@ -57,16 +57,41 @@ export async function POST(
       return NextResponse.json({ error: "Tool call already processed" }, { status: 409 });
     }
 
-    // Close ALL active web sessions for this user so the next message starts
-    // with a clean context and cannot re-trigger the cancelled scheduling flow.
-    await db
-      .from("agent_sessions")
-      .update({ status: "closed" })
-      .eq("user_id", user.id)
-      .eq("channel", "web")
-      .eq("status", "active");
+    try {
+      const runtime = await loadAgentRuntimeContext(db, user.id);
+      const result = await resumeAgent(
+        {
+          message: "",
+          db,
+          userId: user.id,
+          sessionId: rejectedToolCall.session_id,
+          systemPrompt: runtime.systemPrompt,
+          enabledTools: runtime.enabledTools,
+          integrations: runtime.integrations,
+          integrationSecrets: runtime.integrationSecrets,
+        },
+        { type: "reject", message: "Acción cancelada por el usuario." }
+      );
 
-    return NextResponse.json({ ok: true, message: "Acción cancelada." });
+      if (toolCall.tool_name === "calendar_create_event") {
+        await db
+          .from("agent_sessions")
+          .update({ status: "closed" })
+          .eq("user_id", user.id)
+          .eq("channel", "web")
+          .eq("status", "active");
+      }
+
+      return NextResponse.json({
+        ok: true,
+        message: result.response ?? "Acción cancelada.",
+        pendingConfirmation: result.pendingConfirmation,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "No se pudo procesar la acción.";
+      await addMessage(db, rejectedToolCall.session_id, "assistant", message);
+      return NextResponse.json({ error: message }, { status: 500 });
+    }
   }
 
   const approvedToolCall = await approveToolCall(db, toolCallId);
@@ -76,20 +101,24 @@ export async function POST(
 
   try {
     const runtime = await loadAgentRuntimeContext(db, user.id);
-    const execution = await executeToolCallById(
+    const result = await resumeAgent(
       {
+        message: "",
         db,
         userId: user.id,
         sessionId: approvedToolCall.session_id,
+        systemPrompt: runtime.systemPrompt,
         enabledTools: runtime.enabledTools,
         integrations: runtime.integrations,
         integrationSecrets: runtime.integrationSecrets,
       },
-      toolCallId
+      { type: "approve", toolCallId }
     );
-
-    await addMessage(db, approvedToolCall.session_id, "assistant", execution.result.message);
-    return NextResponse.json({ ok: true, message: execution.result.message });
+    return NextResponse.json({
+      ok: true,
+      message: result.response,
+      pendingConfirmation: result.pendingConfirmation,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "No se pudo ejecutar la acción.";
     await addMessage(db, approvedToolCall.session_id, "assistant", message);

@@ -4,6 +4,7 @@ import { createServerClient, getOrCreateSession } from "@agents/db";
 import { runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 import {
+  injectBashContinuation,
   injectSchedulingDirective,
   injectSchedulingContinuation,
   injectDateContext,
@@ -80,9 +81,14 @@ export async function POST(request: Request) {
       // Active scheduling flow — continuation directive takes precedence
       processedMessage = afterContinuation;
     } else {
-      // No active scheduling flow — apply availability date context then directive
-      processedMessage = await injectDateContext(db, session.id, processedMessage, runtime.timezone);
-      processedMessage = injectSchedulingDirective(processedMessage);
+      const afterBashContinuation = await injectBashContinuation(db, session.id, processedMessage);
+      if (afterBashContinuation !== processedMessage) {
+        processedMessage = afterBashContinuation;
+      } else {
+        // No active special flow — apply availability date context then directive
+        processedMessage = await injectDateContext(db, session.id, processedMessage, runtime.timezone);
+        processedMessage = injectSchedulingDirective(processedMessage);
+      }
     }
 
     const result = await runAgent({

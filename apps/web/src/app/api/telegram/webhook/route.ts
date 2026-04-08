@@ -5,9 +5,10 @@ import {
   createServerClient,
   rejectToolCall,
 } from "@agents/db";
-import { executeToolCallById, runAgent } from "@agents/agent";
+import { resumeAgent, runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 import {
+  injectBashContinuation,
   injectSchedulingDirective,
   injectSchedulingContinuation,
   injectDateContext,
@@ -186,23 +187,39 @@ export async function POST(request: Request) {
       }
 
       await answerCallbackQuery(cb.id, "Aprobado");
+      await sendTelegramMessage(
+        cb.message.chat.id,
+        approvedToolCall.tool_name === "bash"
+          ? "Ejecutando el comando aprobado..."
+          : "Procesando la acción aprobada..."
+      );
 
       try {
         const runtime = await loadAgentRuntimeContext(db, telegramAccount.user_id);
-        const execution = await executeToolCallById(
+        const result = await resumeAgent(
           {
+            message: "",
             db,
             userId: telegramAccount.user_id,
             sessionId: approvedToolCall.session_id,
+            systemPrompt: runtime.systemPrompt,
             enabledTools: runtime.enabledTools,
             integrations: runtime.integrations,
             integrationSecrets: runtime.integrationSecrets,
           },
-          toolCallId
+          { type: "approve", toolCallId }
         );
 
-        await addMessage(db, approvedToolCall.session_id, "assistant", execution.result.message);
-        await sendTelegramMessage(cb.message.chat.id, execution.result.message);
+        if (result.pendingConfirmation) {
+          await sendTelegramMessage(cb.message.chat.id, result.pendingConfirmation.message, {
+            inline_keyboard: [[
+              { text: "Aprobar", callback_data: `approve:${result.pendingConfirmation.toolCallId}` },
+              { text: "Cancelar", callback_data: `reject:${result.pendingConfirmation.toolCallId}` },
+            ]],
+          });
+        } else if (result.response) {
+          await sendTelegramMessage(cb.message.chat.id, result.response);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "No se pudo ejecutar la acción.";
         await addMessage(db, approvedToolCall.session_id, "assistant", message);
@@ -215,9 +232,38 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: true });
       }
 
-      await addMessage(db, rejectedToolCall.session_id, "assistant", "Acción cancelada.");
       await answerCallbackQuery(cb.id, "Rechazado");
-      await sendTelegramMessage(cb.message.chat.id, "Acción cancelada.");
+      try {
+        const runtime = await loadAgentRuntimeContext(db, telegramAccount.user_id);
+        const result = await resumeAgent(
+          {
+            message: "",
+            db,
+            userId: telegramAccount.user_id,
+            sessionId: rejectedToolCall.session_id,
+            systemPrompt: runtime.systemPrompt,
+            enabledTools: runtime.enabledTools,
+            integrations: runtime.integrations,
+            integrationSecrets: runtime.integrationSecrets,
+          },
+          { type: "reject", message: "Acción cancelada por el usuario." }
+        );
+
+        if (result.pendingConfirmation) {
+          await sendTelegramMessage(cb.message.chat.id, result.pendingConfirmation.message, {
+            inline_keyboard: [[
+              { text: "Aprobar", callback_data: `approve:${result.pendingConfirmation.toolCallId}` },
+              { text: "Cancelar", callback_data: `reject:${result.pendingConfirmation.toolCallId}` },
+            ]],
+          });
+        } else {
+          await sendTelegramMessage(cb.message.chat.id, result.response ?? "Acción cancelada.");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "No se pudo procesar la acción.";
+        await addMessage(db, rejectedToolCall.session_id, "assistant", message);
+        await sendTelegramMessage(cb.message.chat.id, message);
+      }
     }
 
     return NextResponse.json({ ok: true });
@@ -401,8 +447,13 @@ export async function POST(request: Request) {
   if (afterContinuation !== text) {
     text = afterContinuation;
   } else {
-    text = await injectDateContext(db, session.id, text, runtime.timezone);
-    text = injectSchedulingDirective(text);
+    const afterBashContinuation = await injectBashContinuation(db, session.id, text);
+    if (afterBashContinuation !== text) {
+      text = afterBashContinuation;
+    } else {
+      text = await injectDateContext(db, session.id, text, runtime.timezone);
+      text = injectSchedulingDirective(text);
+    }
   }
 
   try {

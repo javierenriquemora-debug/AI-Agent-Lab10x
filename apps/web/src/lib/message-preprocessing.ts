@@ -126,6 +126,8 @@ const DATE_ISO_RE = /\b(\d{4}-\d{2}-\d{2})\b/;
  * datetime offsets like "08:00:00-05:00".
  */
 const AVAILABILITY_RESULT_RE = /\d{2}:\d{2}\s+-\s+\d{2}:\d{2}/;
+const BASH_COMMAND_REQUEST_RE = /[¿?]Qu[eé]\s+comando\s+bash/i;
+const BASH_TERMINAL_REQUEST_RE = /[¿?]En\s+qu[eé]\s+terminal\s+te\s+gustar[ií]a\s+ejecutar\s+el\s+comando\s+(.+?)\??$/i;
 
 /**
  * When a follow-up message has no explicit date/day but either:
@@ -193,6 +195,50 @@ export async function injectDateContext(
 
       return `[Fecha de contexto: ${label} / ${isoDate}. Usa esta fecha para construir los rangos de tiempo.]\n\n${text}`;
     }
+  }
+
+  return text;
+}
+
+function stripInjectedDirective(text: string): string {
+  return text.replace(/^\[[\s\S]*?\]\n\n/, "");
+}
+
+export async function injectBashContinuation(
+  db: DbClient,
+  sessionId: string,
+  text: string
+): Promise<string> {
+  const { data: messages } = await db
+    .from("agent_messages")
+    .select("role, content")
+    .eq("session_id", sessionId)
+    .order("created_at", { ascending: false })
+    .limit(6);
+
+  if (!messages || messages.length === 0) return text;
+
+  const lastAssistant = messages.find((m) => m.role === "assistant");
+  const lastAssistantContent = stripInjectedDirective((lastAssistant?.content as string) ?? "").trim();
+  if (!lastAssistantContent) return text;
+
+  if (BASH_COMMAND_REQUEST_RE.test(lastAssistantContent)) {
+    return (
+      `[CONTINUACIÓN BASH. El usuario ya proporcionó el comando: "${text}". ` +
+      `Si no indicó terminal explícita, usa terminal="default" sin preguntarlo. ` +
+      `Llama la tool bash con prompt="${text}" y terminal="default".]\n\n${text}`
+    );
+  }
+
+  const terminalMatch = lastAssistantContent.match(BASH_TERMINAL_REQUEST_RE);
+  if (terminalMatch) {
+    const previousPrompt = terminalMatch[1].trim().replace(/^["']|["']$/g, "");
+    const terminalName = text.trim();
+    return (
+      `[CONTINUACIÓN BASH. El usuario ya proporcionó el nombre de terminal: "${terminalName}". ` +
+      `El comando pendiente es: "${previousPrompt}". ` +
+      `Llama la tool bash con prompt="${previousPrompt}" y terminal="${terminalName}".]\n\n${text}`
+    );
   }
 
   return text;

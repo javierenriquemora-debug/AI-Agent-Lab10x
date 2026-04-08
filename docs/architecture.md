@@ -14,7 +14,7 @@
 | Base de datos + Auth  | Supabase (Postgres + Auth + RLS)     | `packages/db`                        |
 | Tipos compartidos     | TypeScript                           | `packages/types`                     |
 | Config compartida     | tsconfig                             | `packages/config`                    |
-| Modelo LLM            | OpenRouter (GPT-4o-mini por defecto) | vía `@langchain/openai` con base URL |
+| Modelo LLM            | OpenRouter o Gemini (según env)      | vía `@langchain/openai`              |
 | Transcripción de voz  | Google Gemini Flash (`gemini-2.5-flash`) | API REST directa                 |
 
 ---
@@ -57,6 +57,7 @@
 │   │       └── tools/
 │   │           ├── catalog.ts              # Definiciones (id, risk, schema Zod)
 │   │           ├── adapters.ts             # Wrappers LangChain + lógica de negocio
+│   │           ├── terminal-session-manager.ts # Sesiones persistentes de la tool bash
 │   │           ├── google-calendar-client.ts  # freeBusy, listEvents, createEvent
 │   │           ├── google-contacts-client.ts  # searchContacts (People API)
 │   │           └── github-client.ts           # GitHub REST API
@@ -114,8 +115,8 @@
 └─────────────────────────────────────────────────┘
                          │
           ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-  Google Calendar  Google Contacts   GitHub API
+          ▼              ▼              ▼              ▼
+  Google Calendar  Google Contacts   GitHub API    Host Shell
 ```
 
 ---
@@ -184,6 +185,7 @@ Definidas en `packages/agent/src/tools/catalog.ts`, implementadas en `adapters.t
 
 | Tool ID                      | Riesgo | Descripción |
 | ---------------------------- | ------ | ----------- |
+| `bash`                       | alto   | Ejecuta comandos del sistema en una sesión persistente por nombre. Usa el shell real del host y siempre requiere confirmación. |
 | `calendar_check_availability`| bajo   | Consulta `freeBusy` del calendario primario. Filtra slots < 30 min. |
 | `calendar_list_events`       | bajo   | Lista eventos próximos con asistentes, links y ubicación. |
 | `calendar_create_event`      | medio  | Crea evento (requiere confirmación). Pide Aprobar/Cancelar. |
@@ -206,6 +208,14 @@ Definidas en `packages/agent/src/tools/catalog.ts`, implementadas en `adapters.t
 - Filtra eventos de todo el día (duración ≥ 23 h).
 - Filtra slots libres menores a **30 minutos**.
 
+### Flujo de `bash`
+- La sesión se identifica por `terminal` y se mantiene en memoria mientras viva el servidor.
+- Si el usuario no envía `terminal`, se usa `default` automáticamente.
+- Si la sesión no existe, se crea; si existe, se reutiliza.
+- La ejecución real depende del host actual. En este entorno corre sobre `powershell.exe`.
+- La salida de `stdout`/`stderr` se devuelve truncada cuando supera el límite configurado.
+- Si el comando excede el timeout, la sesión se recicla para evitar contaminar ejecuciones posteriores.
+
 ---
 
 ## LangGraph: grafo
@@ -215,6 +225,7 @@ Definidas en `packages/agent/src/tools/catalog.ts`, implementadas en `adapters.t
 - **MemorySaver** como checkpointer (`thread_id = session_id`).
 - Máximo 6 iteraciones de tool para evitar loops.
 - Tools de riesgo medio/alto → devuelven `pending_confirmation` en lugar de ejecutar.
+- `bash` reutiliza el mismo flujo `interrupt + resume` usado por el resto de tools con confirmación.
 
 ---
 
@@ -252,6 +263,7 @@ Ver migración en `packages/db/supabase/migrations/00001_initial_schema.sql`.
 - **RLS** en todas las tablas con datos de usuario.
 - **Allowlist de tools**: solo se montan las que el usuario habilitó Y tiene integración activa.
 - **Confirmación humana**: tools de riesgo medio/alto generan `pending_confirmation`. Web: prompt UI. Telegram: botones inline.
+- **Tool `bash`**: registra siempre el comando exacto en `tool_calls.arguments_json`, impone timeout y trunca salidas largas.
 - **Tokens OAuth**: campo `encrypted_tokens` en `user_integrations` (cifrado AES con `OAUTH_ENCRYPTION_KEY`).
 - **Webhook Telegram**: validado con `X-Telegram-Bot-Api-Secret-Token`.
 

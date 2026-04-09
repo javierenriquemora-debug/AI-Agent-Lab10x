@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { DbClient } from "@agents/db";
 export { formatMessageToHtml as markdownToHtml } from "./format-message";
 
@@ -128,6 +129,20 @@ const DATE_ISO_RE = /\b(\d{4}-\d{2}-\d{2})\b/;
 const AVAILABILITY_RESULT_RE = /\d{2}:\d{2}\s+-\s+\d{2}:\d{2}/;
 const BASH_COMMAND_REQUEST_RE = /[¿?]Qu[eé]\s+comando\s+bash/i;
 const BASH_TERMINAL_REQUEST_RE = /[¿?]En\s+qu[eé]\s+terminal\s+te\s+gustar[ií]a\s+ejecutar\s+el\s+comando\s+(.+?)\??$/i;
+const FILE_NAME_REQUEST_RE =
+  /(nombre del nuevo archivo|c[oó]mo quieres llamarlo|como quieres llamarlo|ruta del nuevo archivo|en qu[eé] ruta quieres crear|d[oó]nde quieres crear(?:lo| el archivo))/i;
+const FILE_CREATE_RE =
+  /\b(crea|crear|genera|escribe|guarda|haz)\b.*\b(archivo|copia)\b/i;
+const FILE_SUMMARY_SOURCE_RE =
+  /\b(resumen anterior|este resumen|con el resumen|usando el resumen|a partir del resumen|versi[oó]n resumida)\b/i;
+const FILE_EXACT_COPY_RE =
+  /\b(copia exacta|copia fiel|duplicado exacto|igual al original|mismo contenido|exactamente igual)\b/i;
+const FILE_PATH_RE =
+  /([A-Za-z0-9._/-]+(?:\\[A-Za-z0-9._-]+)*(?:\/[A-Za-z0-9._-]+)*\.[A-Za-z0-9._-]+)/g;
+const SCHEDULED_TASK_INTENT_RE =
+  /\b(tarea(s)? programada(s)?|recu[eé]rdame|recu[eé]rdame|av[ií]same|notif[ií]came|recordarme|recordatorio|cada\s+(d[ií]a|semana|mes)|todos?\s+los\s+d[ií]as|semanal|mensual)\b/i;
+const EXACT_MESSAGE_RE =
+  /(?:mensaje|texto)\s*:?\s*["“]([^"”]+)["”]|env[ií]ame exactamente(?:\s+por telegram)?\s+este mensaje\s*:?\s*["“]([^"”]+)["”]/i;
 
 /**
  * When a follow-up message has no explicit date/day but either:
@@ -204,6 +219,26 @@ function stripInjectedDirective(text: string): string {
   return text.replace(/^\[[\s\S]*?\]\n\n/, "");
 }
 
+function normalizeRepoRelativePath(rawPath: string): string {
+  return rawPath.trim().replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/{2,}/g, "/");
+}
+
+function extractLikelyFilePath(text: string): string | null {
+  const matches = text.match(FILE_PATH_RE) ?? [];
+  if (matches.length === 0) return null;
+  return normalizeRepoRelativePath(matches[matches.length - 1]);
+}
+
+function buildDestinationPathFromReply(replyText: string, sourcePath: string | null): string {
+  const normalizedReply = normalizeRepoRelativePath(replyText);
+  if (normalizedReply.includes("/")) return normalizedReply;
+  if (!sourcePath) return normalizedReply;
+
+  const sourceDir = path.posix.dirname(normalizeRepoRelativePath(sourcePath));
+  if (!sourceDir || sourceDir === ".") return normalizedReply;
+  return path.posix.join(sourceDir, normalizedReply);
+}
+
 export async function injectBashContinuation(
   db: DbClient,
   sessionId: string,
@@ -242,6 +277,117 @@ export async function injectBashContinuation(
   }
 
   return text;
+}
+
+export async function injectFileContinuation(
+  db: DbClient,
+  sessionId: string,
+  text: string
+): Promise<string> {
+  const { data: messages } = await db
+    .from("agent_messages")
+    .select("role, content")
+    .eq("session_id", sessionId)
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (!messages || messages.length === 0) return text;
+
+  const normalizedText = text.trim();
+  const latestAssistant = messages.find((m) => m.role === "assistant");
+  const lastAssistantContent = stripInjectedDirective((latestAssistant?.content as string) ?? "").trim();
+  const previousUserContent = stripInjectedDirective(
+    ((messages.find((m) => m.role === "user")?.content as string) ?? "")
+  ).trim();
+  const previousAssistantSummary = stripInjectedDirective(
+    ((messages.find(
+      (m) =>
+        m.role === "assistant" &&
+        m.content !== latestAssistant?.content &&
+        /resumen del archivo|aqu[ií]\s+tienes un resumen/i.test(String(m.content))
+    )?.content as string) ?? "")
+  ).trim();
+
+  const sourcePath =
+    extractLikelyFilePath(previousAssistantSummary) ||
+    extractLikelyFilePath(lastAssistantContent) ||
+    extractLikelyFilePath(previousUserContent);
+
+  if (FILE_NAME_REQUEST_RE.test(lastAssistantContent)) {
+    const destinationPath = buildDestinationPathFromReply(normalizedText, sourcePath);
+
+    if (FILE_EXACT_COPY_RE.test(previousUserContent) && sourcePath) {
+      return (
+        `[CONTINUACIÓN ARCHIVOS. El usuario ya proporcionó la ruta destino: "${destinationPath}". ` +
+        `La solicitud pendiente es crear una copia exacta del archivo "${sourcePath}". ` +
+        `Primero llama read_file con path="${sourcePath}", luego llama write_file con path="${destinationPath}" usando exactamente el contenido leído. ` +
+        `No pidas más datos.]\n\n${text}`
+      );
+    }
+
+    if (FILE_SUMMARY_SOURCE_RE.test(previousUserContent) && previousAssistantSummary) {
+      return (
+        `[CONTINUACIÓN ARCHIVOS. El usuario ya proporcionó la ruta destino: "${destinationPath}". ` +
+        `La solicitud pendiente es crear un archivo nuevo usando como contenido el resumen anterior. ` +
+        `Llama write_file con path="${destinationPath}" y con content basado en tu respuesta anterior de resumen. ` +
+        `No pidas más datos.]\n\n${text}`
+      );
+    }
+  }
+
+  if (FILE_CREATE_RE.test(normalizedText)) {
+    const destinationPath = extractLikelyFilePath(normalizedText);
+
+    if (destinationPath && FILE_EXACT_COPY_RE.test(normalizedText) && sourcePath) {
+      return (
+        `[INSTRUCCIÓN ARCHIVOS. El usuario quiere crear una copia exacta de "${sourcePath}" en "${destinationPath}". ` +
+        `Primero llama read_file con path="${sourcePath}", luego llama write_file con path="${destinationPath}" usando exactamente el contenido leído.]\n\n${text}`
+      );
+    }
+
+    if (destinationPath && FILE_SUMMARY_SOURCE_RE.test(normalizedText) && previousAssistantSummary) {
+      return (
+        `[INSTRUCCIÓN ARCHIVOS. El usuario quiere crear un archivo nuevo en "${destinationPath}" usando como contenido el resumen anterior. ` +
+        `Llama write_file con path="${destinationPath}" y con content basado en tu respuesta anterior de resumen. ` +
+        `No vuelvas a pedir el nombre del archivo ni el contenido.]\n\n${text}`
+      );
+    }
+  }
+
+  return text;
+}
+
+// ─── Scheduled task directives ───────────────────────────────────────────────
+
+export function injectScheduledTaskDirective(text: string): string {
+  if (!SCHEDULED_TASK_INTENT_RE.test(text)) return text;
+
+  const exactMessageMatch = text.match(EXACT_MESSAGE_RE);
+  const exactMessage =
+    exactMessageMatch?.[1]?.trim() || exactMessageMatch?.[2]?.trim() || null;
+
+  const promptHint = exactMessage
+    ? `Si el usuario ya dio un mensaje exacto, NO guardes solo "${exactMessage}". ` +
+      `Guarda un prompt autosuficiente como: "Envía exactamente por Telegram este mensaje: \\"${exactMessage}\\". No hagas preguntas adicionales."`
+    : "El campo prompt de create_scheduled_task debe ser una instrucción autosuficiente que el agente pueda ejecutar después sin pedir contexto adicional.";
+
+  return (
+    `[INSTRUCCIÓN TAREA PROGRAMADA. El usuario quiere crear una tarea programada, NO un evento de calendario. ` +
+    `Si ya están claros qué hacer y cuándo, llama create_scheduled_task. ` +
+    `${promptHint} ` +
+    `Si falta información, pide SOLO el primer dato faltante.]\n\n${text}`
+  );
+}
+
+export function buildScheduledExecutionMessage(prompt: string): string {
+  return (
+    `[EJECUCIÓN PROGRAMADA. Esta instrucción viene de una tarea ya creada y vencida. ` +
+    `NO vuelvas a programar create_scheduled_task. ` +
+    `NO preguntes fecha, hora ni qué debe recordarse. ` +
+    `Ejecuta directamente la instrucción guardada. ` +
+    `Si la instrucción consiste en enviar un mensaje, envíalo sin pedir aclaraciones. ` +
+    `Solo haz una pregunta si la instrucción es realmente imposible de ejecutar tal como está escrita.]\n\n${prompt}`
+  );
 }
 
 // ─── Scheduling directive injection ──────────────────────────────────────────

@@ -26,6 +26,10 @@ const TOOL_IDS = [
   "calendar_check_availability",
   "calendar_list_events",
   "calendar_create_event",
+  "read_file",
+  "write_file",
+  "edit_file",
+  "create_scheduled_task",
 ];
 
 export function SettingsForm({

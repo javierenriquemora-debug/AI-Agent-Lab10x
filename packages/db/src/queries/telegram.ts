@@ -35,3 +35,15 @@ export async function getUserByTelegramId(
     .single();
   return data as TelegramAccount | null;
 }
+
+export async function getTelegramAccountByUserId(
+  db: DbClient,
+  userId: string
+) {
+  const { data } = await db
+    .from("telegram_accounts")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle();
+  return data as TelegramAccount | null;
+}

@@ -1,9 +1,23 @@
 import { tool } from "@langchain/core/tools";
+import { existsSync, promises as fs } from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 import type { DbClient } from "@agents/db";
-import type { ToolCall, UserIntegration, UserToolSetting } from "@agents/types";
+import type {
+  ScheduledTaskChannel,
+  ScheduledTaskRecurrence,
+  ToolCall,
+  UserIntegration,
+  UserToolSetting,
+} from "@agents/types";
 import { TOOL_CATALOG } from "./catalog";
-import { createToolCall, getToolCallById, updateToolCallStatus } from "@agents/db";
+import {
+  createScheduledTask,
+  createToolCall,
+  getTelegramAccountByUserId,
+  getToolCallById,
+  updateToolCallStatus,
+} from "@agents/db";
 import {
   createGithubIssue,
   createGithubRepository,
@@ -84,7 +98,11 @@ const calendarCreateEventSchema = z.object({
   description: z.string().optional().default(""),
   location: z.string().optional().default(""),
   time_zone: z.string().optional().default("UTC"),
-  attendee_emails: z.array(z.string()).optional().default([]).describe("List of attendee email addresses"),
+  attendee_emails: z
+    .array(z.string())
+    .optional()
+    .default([])
+    .describe("List of attendee email addresses"),
 });
 
 const githubListReposSchema = z.object({
@@ -119,10 +137,377 @@ const bashToolSchema = z.object({
   prompt: z.string().min(1).describe("Command text to execute inside the selected terminal"),
 });
 
-function isToolAvailable(
-  toolId: string,
+const filePathSchema = z
+  .string()
+  .min(1)
+  .describe("Absolute path or path relative to the repository root");
+
+const readFileToolSchema = z.object({
+  path: filePathSchema,
+  offset: z
+    .number()
+    .int()
+    .refine((value) => value !== 0, "offset cannot be 0")
+    .optional()
+    .describe("Line offset to start reading from. Positive values are 1-indexed; negative values count from the end."),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum number of lines to return"),
+});
+
+const writeFileToolSchema = z.object({
+  path: filePathSchema,
+  content: z.string().describe("Full text content to write into the new file"),
+});
+
+const editFileToolSchema = z.object({
+  path: filePathSchema,
+  old_string: z.string().min(1).describe("Exact existing text to replace. It must be unique in the file."),
+  new_string: z.string().describe("Replacement text"),
+});
+
+const createScheduledTaskSchema = z
+  .object({
+    prompt: z
+      .string()
+      .min(1)
+      .describe("Natural-language instruction that the agent should execute when the task becomes due"),
+    schedule_type: z.enum(["one_time", "recurring"]),
+    run_at: z
+      .string()
+      .min(1)
+      .describe("First execution datetime in ISO 8601 format with timezone offset"),
+    recurrence: z
+      .enum(["daily", "weekly", "monthly"])
+      .optional()
+      .describe("Required only when schedule_type is recurring"),
+    timezone: z
+      .string()
+      .min(1)
+      .optional()
+      .default("America/Bogota")
+      .describe("IANA timezone for the scheduled task"),
+    channel: z
+      .enum(["telegram"])
+      .optional()
+      .default("telegram")
+      .describe("Delivery channel for the scheduled task"),
+  })
+  .superRefine((input, ctx) => {
+    const parsedDate = new Date(input.run_at);
+    if (Number.isNaN(parsedDate.getTime())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["run_at"],
+        message: "run_at must be a valid ISO 8601 datetime",
+      });
+    }
+
+    if (input.schedule_type === "recurring" && !input.recurrence) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["recurrence"],
+        message: "recurrence is required when schedule_type is recurring",
+      });
+    }
+
+    if (input.schedule_type === "one_time" && input.recurrence) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["recurrence"],
+        message: "recurrence must be omitted when schedule_type is one_time",
+      });
+    }
+  });
+
+function getRepoRoot(): string {
+  const candidates = [
+    process.cwd(),
+    path.resolve(process.cwd(), ".."),
+    path.resolve(process.cwd(), "../.."),
+  ];
+
+  return (
+    candidates.find((candidate) => {
+      return (
+        existsSync(path.join(candidate, "package.json")) &&
+        existsSync(path.join(candidate, "apps")) &&
+        existsSync(path.join(candidate, "packages"))
+      );
+    }) ?? process.cwd()
+  );
+}
+
+const REPO_ROOT = getRepoRoot();
+
+function resolveRepoPath(inputPath: string): string {
+  const resolved = path.isAbsolute(inputPath)
+    ? path.normalize(inputPath)
+    : path.resolve(REPO_ROOT, inputPath);
+  const relative = path.relative(REPO_ROOT, resolved);
+
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(
+      `La ruta "${inputPath}" está fuera del repositorio. Usa una ruta dentro de ${REPO_ROOT}.`
+    );
+  }
+
+  return resolved;
+}
+
+function countOccurrences(content: string, search: string): number {
+  return content.split(search).length - 1;
+}
+
+function splitFileLines(content: string): string[] {
+  if (content.length === 0) return [];
+  return content.split(/\r?\n/);
+}
+
+function formatNumberedLines(lines: string[], startLineNumber: number): string {
+  return lines.map((line, index) => `${startLineNumber + index}|${line}`).join("\n");
+}
+
+function computeNextRunAt(
+  runAtIso: string,
+  scheduleType: "one_time" | "recurring",
+  recurrence?: ScheduledTaskRecurrence
+): string {
+  const current = new Date(runAtIso);
+  if (Number.isNaN(current.getTime())) {
+    throw new Error(`No se pudo programar la tarea: run_at "${runAtIso}" no es válido.`);
+  }
+
+  if (scheduleType === "one_time") {
+    return current.toISOString();
+  }
+
+  if (!recurrence) {
+    throw new Error("No se pudo programar la tarea: recurrence es obligatoria para tareas recurrentes.");
+  }
+
+  return current.toISOString();
+}
+
+async function executeReadFileTool(
+  rawInput: Record<string, unknown>
+): Promise<ToolExecutionResult> {
+  const input = readFileToolSchema.parse(rawInput);
+  const resolvedPath = resolveRepoPath(input.path);
+
+  let content: string;
+  try {
+    content = await fs.readFile(resolvedPath, "utf8");
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      throw new Error(`No se pudo leer "${input.path}": el archivo no existe.`);
+    }
+    throw new Error(
+      `No se pudo leer "${input.path}": ${err.message ?? "error de lectura desconocido"}.`
+    );
+  }
+
+  const lines = splitFileLines(content);
+  const totalLines = lines.length;
+
+  if (totalLines === 0) {
+    return {
+      message: `Archivo leído correctamente: ${input.path}. El archivo está vacío.`,
+      path: resolvedPath,
+      totalLines: 0,
+      returnedLines: 0,
+      content: "",
+    };
+  }
+
+  let startIndex = 0;
+  if (typeof input.offset === "number") {
+    if (input.offset > 0) {
+      if (input.offset > totalLines) {
+        throw new Error(
+          `No se pudo leer "${input.path}": offset ${input.offset} excede el total de líneas (${totalLines}).`
+        );
+      }
+      startIndex = input.offset - 1;
+    } else {
+      if (Math.abs(input.offset) > totalLines) {
+        throw new Error(
+          `No se pudo leer "${input.path}": offset ${input.offset} excede el total de líneas (${totalLines}).`
+        );
+      }
+      startIndex = totalLines + input.offset;
+    }
+  }
+
+  const selectedLines =
+    typeof input.limit === "number"
+      ? lines.slice(startIndex, startIndex + input.limit)
+      : lines.slice(startIndex);
+
+  return {
+    message: `Archivo leído correctamente: ${input.path}.`,
+    path: resolvedPath,
+    totalLines,
+    returnedLines: selectedLines.length,
+    offsetApplied: input.offset ?? 1,
+    limitApplied: input.limit ?? null,
+    content: formatNumberedLines(selectedLines, startIndex + 1),
+  };
+}
+
+async function executeWriteFileTool(
+  rawInput: Record<string, unknown>
+): Promise<ToolExecutionResult> {
+  const input = writeFileToolSchema.parse(rawInput);
+  const resolvedPath = resolveRepoPath(input.path);
+  const parentDirectory = path.dirname(resolvedPath);
+
+  try {
+    await fs.access(resolvedPath);
+    throw new Error(`No se pudo crear "${input.path}": el archivo ya existe.`);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (!(err instanceof Error) || err.message.startsWith("No se pudo crear")) {
+      throw error;
+    }
+    if (err.code !== "ENOENT") {
+      throw new Error(
+        `No se pudo validar "${input.path}": ${err.message ?? "error desconocido"}.`
+      );
+    }
+  }
+
+  try {
+    const stats = await fs.stat(parentDirectory);
+    if (!stats.isDirectory()) {
+      throw new Error(`No se pudo crear "${input.path}": la carpeta padre no es válida.`);
+    }
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err instanceof Error && err.message.startsWith("No se pudo crear")) {
+      throw error;
+    }
+    if (err.code === "ENOENT") {
+      throw new Error(
+        `No se pudo crear "${input.path}": la carpeta padre "${path.relative(REPO_ROOT, parentDirectory) || "."}" no existe.`
+      );
+    }
+    throw new Error(
+      `No se pudo validar la carpeta padre de "${input.path}": ${err.message ?? "error desconocido"}.`
+    );
+  }
+
+  try {
+    await fs.writeFile(resolvedPath, input.content, { flag: "wx" });
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "EEXIST") {
+      throw new Error(`No se pudo crear "${input.path}": el archivo ya existe.`);
+    }
+    throw new Error(
+      `No se pudo crear "${input.path}": ${err.message ?? "error de escritura desconocido"}.`
+    );
+  }
+
+  return {
+    message: `Archivo creado correctamente: ${input.path}.`,
+    path: resolvedPath,
+    charsWritten: input.content.length,
+    bytesWritten: Buffer.byteLength(input.content, "utf8"),
+  };
+}
+
+async function executeEditFileTool(
+  rawInput: Record<string, unknown>
+): Promise<ToolExecutionResult> {
+  const input = editFileToolSchema.parse(rawInput);
+  const resolvedPath = resolveRepoPath(input.path);
+
+  let content: string;
+  try {
+    content = await fs.readFile(resolvedPath, "utf8");
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      throw new Error(`No se pudo editar "${input.path}": el archivo no existe.`);
+    }
+    throw new Error(
+      `No se pudo leer "${input.path}" para editarlo: ${err.message ?? "error desconocido"}.`
+    );
+  }
+
+  const occurrences = countOccurrences(content, input.old_string);
+  if (occurrences === 0) {
+    throw new Error(
+      `No se pudo editar "${input.path}": old_string no aparece en el archivo.`
+    );
+  }
+  if (occurrences > 1) {
+    throw new Error(
+      `No se pudo editar "${input.path}": old_string aparece ${occurrences} veces. Usa un texto más específico para evitar ambigüedad.`
+    );
+  }
+
+  const updatedContent = content.replace(input.old_string, input.new_string);
+
+  try {
+    await fs.writeFile(resolvedPath, updatedContent, "utf8");
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    throw new Error(
+      `No se pudo guardar "${input.path}": ${err.message ?? "error de escritura desconocido"}.`
+    );
+  }
+
+  return {
+    message: `Archivo editado correctamente: ${input.path}.`,
+    path: resolvedPath,
+    replacements: 1,
+  };
+}
+
+async function executeCreateScheduledTaskTool(
+  rawInput: Record<string, unknown>,
   ctx: ToolContext
-): boolean {
+): Promise<ToolExecutionResult> {
+  const input = createScheduledTaskSchema.parse(rawInput);
+
+  if (input.channel === "telegram") {
+    const telegramAccount = await getTelegramAccountByUserId(ctx.db, ctx.userId);
+    if (!telegramAccount) {
+      throw new Error(
+        "No se pudo crear la tarea programada: el usuario no tiene Telegram vinculado y ese es el canal por defecto."
+      );
+    }
+  }
+
+  const nextRunAt = computeNextRunAt(input.run_at, input.schedule_type, input.recurrence);
+  const task = await createScheduledTask(ctx.db, {
+    userId: ctx.userId,
+    prompt: input.prompt,
+    scheduleType: input.schedule_type,
+    recurrence: input.recurrence ?? null,
+    runAt: new Date(input.run_at).toISOString(),
+    nextRunAt,
+    timezone: input.timezone,
+    channel: input.channel as ScheduledTaskChannel,
+    createdViaSessionId: ctx.sessionId,
+  });
+
+  return {
+    message:
+      input.schedule_type === "one_time"
+        ? `Tarea programada creada para ejecutarse una vez el ${input.run_at}.`
+        : `Tarea programada recurrente creada. Primera ejecución: ${input.run_at}. Frecuencia: ${input.recurrence}.`,
+    task,
+  };
+}
+
+function isToolAvailable(toolId: string, ctx: ToolContext): boolean {
   const setting = ctx.enabledTools.find((t) => t.tool_id === toolId);
   if (!setting?.enabled) return false;
 
@@ -224,10 +609,24 @@ async function executeGoogleCalendarTool(
 
     const summary = results.map((r) => {
       if (r.totalFound === 0) {
-        return { name: r.query, found: false, emails: [] as string[], resolvedEmail: null as string | null, multiple: false, contacts: [] as { name: string; email: string }[] };
+        return {
+          name: r.query,
+          found: false,
+          emails: [] as string[],
+          resolvedEmail: null as string | null,
+          multiple: false,
+          contacts: [] as { name: string; email: string }[],
+        };
       }
       if (r.totalFound === 1) {
-        return { name: r.found[0].name, found: true, multiple: false, emails: r.found[0].emails, resolvedEmail: r.found[0].emails[0], contacts: [{ name: r.found[0].name, email: r.found[0].emails[0] }] };
+        return {
+          name: r.found[0].name,
+          found: true,
+          multiple: false,
+          emails: r.found[0].emails,
+          resolvedEmail: r.found[0].emails[0],
+          contacts: [{ name: r.found[0].name, email: r.found[0].emails[0] }],
+        };
       }
       return {
         name: r.query,
@@ -247,14 +646,14 @@ async function executeGoogleCalendarTool(
       } else if (!s.multiple) {
         message += `${s.name}: ${s.resolvedEmail}\n`;
       } else {
-        // Multiple results — list all of them. The system prompt rules decide whether
-        // to ask the user to pick one (scheduling flow) or just display all (informational).
         const list = s.contacts.map((c, i) => `${i + 1}. ${c.name} - ${c.email}`).join("\n");
         message += `Múltiples resultados para "${s.name}":\n${list}\n`;
       }
     }
 
-    const resolvedEmails = summary.filter((s) => s.resolvedEmail).map((s) => s.resolvedEmail);
+    const resolvedEmails = summary
+      .filter((s) => s.resolvedEmail)
+      .map((s) => s.resolvedEmail);
     if (resolvedEmails.length > 0) {
       message += `\nIMPORTANTE: Al crear el evento incluye TODOS los emails resueltos: ${resolvedEmails.join(", ")}`;
     }
@@ -265,11 +664,9 @@ async function executeGoogleCalendarTool(
   if (toolName === "calendar_check_availability") {
     const input = calendarCheckAvailabilitySchema.parse(rawInput);
 
-    // Normalize an ISO string to the user's local timezone while preserving the
-    // actual requested time (not expanding to full day). This corrects off-by-hours
-    // errors when the LLM sends UTC times, while still respecting time windows like "2pm-6pm".
     const getLocalOffset = (tz: string): string => {
-      const offsetRaw = new Date().toLocaleString("en-US", { timeZone: tz, timeZoneName: "shortOffset" })
+      const offsetRaw = new Date()
+        .toLocaleString("en-US", { timeZone: tz, timeZoneName: "shortOffset" })
         .match(/GMT([+-]\d+(?::\d+)?)/)?.[1] ?? "-5";
       const sign = offsetRaw.startsWith("-") ? "-" : "+";
       const [h, m = "0"] = offsetRaw.replace(/[+-]/, "").split(":");
@@ -278,13 +675,19 @@ async function executeGoogleCalendarTool(
 
     const normalizeToLocalTime = (isoStr: string, tz: string): string => {
       const offset = getLocalOffset(tz);
-      // Date-only strings (YYYY-MM-DD) must be treated as midnight local, not UTC midnight.
       if (/^\d{4}-\d{2}-\d{2}$/.test(isoStr)) return `${isoStr}T00:00:00${offset}`;
       const date = new Date(isoStr);
-      const localDate = date.toLocaleDateString("en-CA", { timeZone: tz }); // "YYYY-MM-DD"
-      const [hh, mm, ss] = date.toLocaleTimeString("en-US", {
-        timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit",
-      }).split(":").map((v) => v.padStart(2, "0"));
+      const localDate = date.toLocaleDateString("en-CA", { timeZone: tz });
+      const [hh, mm, ss] = date
+        .toLocaleTimeString("en-US", {
+          timeZone: tz,
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+        .split(":")
+        .map((v) => v.padStart(2, "0"));
       return `${localDate}T${hh}:${mm}:${ss}${offset}`;
     };
 
@@ -295,16 +698,15 @@ async function executeGoogleCalendarTool(
       time_max: normalizeToLocalTime(r.time_max, google.timeZone),
     }));
 
-    const allRanges = [
-      { time_min: normalizedMin, time_max: normalizedMax },
-      ...extraRanges,
-    ];
+    const allRanges = [{ time_min: normalizedMin, time_max: normalizedMax }, ...extraRanges];
 
     const results = await Promise.all(
-      allRanges.map((r) => checkCalendarAvailability(google, r.time_min, r.time_max, ["primary"]))
+      allRanges.map((r) =>
+        checkCalendarAvailability(google, r.time_min, r.time_max, ["primary"])
+      )
     );
 
-    const combined = results.map((r, i) => ({
+    const combined = results.map((r) => ({
       range: `${r.queryRange.start} - ${r.queryRange.end}`,
       date: r.date,
       free: r.free,
@@ -323,7 +725,12 @@ async function executeGoogleCalendarTool(
 
   if (toolName === "calendar_list_events") {
     const input = calendarListEventsSchema.parse(rawInput);
-    const result = await listCalendarEvents(google, input.time_min, input.time_max, input.max_results);
+    const result = await listCalendarEvents(
+      google,
+      input.time_min,
+      input.time_max,
+      input.max_results
+    );
     return {
       message: `Se encontraron ${result.count} evento(s) en tu agenda.`,
       events: result.events,
@@ -379,6 +786,18 @@ function routeToolExecution(
 ): Promise<ToolExecutionResult> {
   if (toolName === "bash") {
     return executeBashTool(input, ctx);
+  }
+  if (toolName === "create_scheduled_task") {
+    return executeCreateScheduledTaskTool(input, ctx);
+  }
+  if (toolName === "read_file") {
+    return executeReadFileTool(input);
+  }
+  if (toolName === "write_file") {
+    return executeWriteFileTool(input);
+  }
+  if (toolName === "edit_file") {
+    return executeEditFileTool(input);
   }
   if (toolName.startsWith("calendar_") || toolName === "contacts_lookup") {
     return executeGoogleCalendarTool(toolName, input, ctx);
@@ -461,9 +880,7 @@ export function buildPendingToolReview(
   if (toolName === "bash") {
     const parsed = bashToolSchema.parse(input);
     const promptPreview =
-      parsed.prompt.length > 160
-        ? `${parsed.prompt.slice(0, 160)}...`
-        : parsed.prompt;
+      parsed.prompt.length > 160 ? `${parsed.prompt.slice(0, 160)}...` : parsed.prompt;
     const terminalMessage =
       parsed.terminal === "default"
         ? "Confirma si deseas ejecutar este comando."
@@ -472,6 +889,40 @@ export function buildPendingToolReview(
       toolName,
       input,
       message: `${terminalMessage} Comando: ${promptPreview}`,
+      allowedDecisions: ["approve", "reject"],
+    };
+  }
+
+  if (toolName === "write_file") {
+    const parsed = writeFileToolSchema.parse(input);
+    return {
+      toolName,
+      input,
+      message: `Confirma si deseas crear el archivo "${parsed.path}".`,
+      allowedDecisions: ["approve", "reject"],
+    };
+  }
+
+  if (toolName === "edit_file") {
+    const parsed = editFileToolSchema.parse(input);
+    return {
+      toolName,
+      input,
+      message: `Confirma si deseas editar el archivo "${parsed.path}".`,
+      allowedDecisions: ["approve", "reject"],
+    };
+  }
+
+  if (toolName === "create_scheduled_task") {
+    const parsed = createScheduledTaskSchema.parse(input);
+    const recurrenceText =
+      parsed.schedule_type === "recurring" ? ` con frecuencia ${parsed.recurrence}` : "";
+    return {
+      toolName,
+      input,
+      message:
+        `Confirma si deseas crear una tarea programada para ${parsed.run_at}${recurrenceText}. ` +
+        `Canal: ${parsed.channel}. Prompt: ${parsed.prompt.slice(0, 160)}${parsed.prompt.length > 160 ? "..." : ""}`,
       allowedDecisions: ["approve", "reject"],
     };
   }
@@ -530,162 +981,170 @@ export function buildLangChainTools(ctx: ToolContext) {
 
   if (isToolAvailable("bash", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("bash", input, ctx),
-        {
-          name: "bash",
-          description:
-            "Executes system commands in a persistent terminal session identified by name and returns the terminal text output. The real shell depends on the host OS.",
-          schema: bashToolSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("bash", input, ctx), {
+        name: "bash",
+        description:
+          "Executes system commands in a persistent terminal session identified by name and returns the terminal text output. The real shell depends on the host OS.",
+        schema: bashToolSchema,
+      })
+    );
+  }
+
+  if (isToolAvailable("create_scheduled_task", ctx)) {
+    tools.push(
+      tool(async (input) => executeImmediateTool("create_scheduled_task", input, ctx), {
+        name: "create_scheduled_task",
+        description:
+          "Creates a scheduled task that will re-run a natural-language prompt later through the agent. Use it for reminders, recurring follow-ups and deferred automations. Defaults to Telegram delivery.",
+        schema: createScheduledTaskSchema,
+      })
+    );
+  }
+
+  if (isToolAvailable("read_file", ctx)) {
+    tools.push(
+      tool(async (input) => executeImmediateTool("read_file", input, ctx), {
+        name: "read_file",
+        description:
+          "Reads a text file from the repository. Use it to inspect existing files. Returns numbered lines and metadata about the slice returned.",
+        schema: readFileToolSchema,
+      })
+    );
+  }
+
+  if (isToolAvailable("write_file", ctx)) {
+    tools.push(
+      tool(async (input) => executeImmediateTool("write_file", input, ctx), {
+        name: "write_file",
+        description:
+          "Creates a new text file inside the repository. Use it only when the target file does not exist yet. Returns the created path and bytes written.",
+        schema: writeFileToolSchema,
+      })
+    );
+  }
+
+  if (isToolAvailable("edit_file", ctx)) {
+    tools.push(
+      tool(async (input) => executeImmediateTool("edit_file", input, ctx), {
+        name: "edit_file",
+        description:
+          "Edits an existing text file by replacing one unique exact string. Use it for precise updates when you know the current text to replace.",
+        schema: editFileToolSchema,
+      })
     );
   }
 
   if (isToolAvailable("get_user_preferences", ctx)) {
     tools.push(
-      tool(
-        async () => {
-          const { getProfile } = await import("@agents/db");
-          const profile = await getProfile(ctx.db, ctx.userId);
-          return JSON.stringify({
-            name: profile.name,
-            timezone: profile.timezone,
-            language: profile.language,
-            agent_name: profile.agent_name,
-          });
-        },
-        {
-          name: "get_user_preferences",
-          description: "Returns the current user preferences and agent configuration.",
-          schema: z.object({}),
-        }
-      )
+      tool(async () => {
+        const { getProfile } = await import("@agents/db");
+        const profile = await getProfile(ctx.db, ctx.userId);
+        return JSON.stringify({
+          name: profile.name,
+          timezone: profile.timezone,
+          language: profile.language,
+          agent_name: profile.agent_name,
+        });
+      }, {
+        name: "get_user_preferences",
+        description: "Returns the current user preferences and agent configuration.",
+        schema: z.object({}),
+      })
     );
   }
 
   if (isToolAvailable("list_enabled_tools", ctx)) {
     tools.push(
-      tool(
-        async () => {
-          const enabled = ctx.enabledTools
-            .filter((t) => t.enabled)
-            .map((t) => t.tool_id);
-          return JSON.stringify(enabled);
-        },
-        {
-          name: "list_enabled_tools",
-          description: "Lists all tools the user has currently enabled.",
-          schema: z.object({}),
-        }
-      )
+      tool(async () => {
+        const enabled = ctx.enabledTools.filter((t) => t.enabled).map((t) => t.tool_id);
+        return JSON.stringify(enabled);
+      }, {
+        name: "list_enabled_tools",
+        description: "Lists all tools the user has currently enabled.",
+        schema: z.object({}),
+      })
     );
   }
 
   if (isToolAvailable("github_list_repos", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("github_list_repos", input, ctx),
-        {
-          name: "github_list_repos",
-          description: "Lists the user's GitHub repositories.",
-          schema: githubListReposSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("github_list_repos", input, ctx), {
+        name: "github_list_repos",
+        description: "Lists the user's GitHub repositories.",
+        schema: githubListReposSchema,
+      })
     );
   }
 
   if (isToolAvailable("github_list_issues", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("github_list_issues", input, ctx),
-        {
-          name: "github_list_issues",
-          description: "Lists issues for a given repository.",
-          schema: githubListIssuesSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("github_list_issues", input, ctx), {
+        name: "github_list_issues",
+        description: "Lists issues for a given repository.",
+        schema: githubListIssuesSchema,
+      })
     );
   }
 
   if (isToolAvailable("github_create_issue", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("github_create_issue", input, ctx),
-        {
-          name: "github_create_issue",
-          description: "Creates a new issue in a GitHub repository. Requires confirmation.",
-          schema: githubCreateIssueSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("github_create_issue", input, ctx), {
+        name: "github_create_issue",
+        description: "Creates a new issue in a GitHub repository. Requires confirmation.",
+        schema: githubCreateIssueSchema,
+      })
     );
   }
 
   if (isToolAvailable("github_create_repo", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("github_create_repo", input, ctx),
-        {
-          name: "github_create_repo",
-          description: "Creates a new GitHub repository. Requires confirmation.",
-          schema: githubCreateRepoSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("github_create_repo", input, ctx), {
+        name: "github_create_repo",
+        description: "Creates a new GitHub repository. Requires confirmation.",
+        schema: githubCreateRepoSchema,
+      })
     );
   }
 
   if (isToolAvailable("contacts_lookup", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("contacts_lookup", input, ctx),
-        {
-          name: "contacts_lookup",
-          description:
-            "Searches Google Contacts by name to find email addresses. Use before creating calendar events when attendee emails are not provided.",
-          schema: contactsLookupSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("contacts_lookup", input, ctx), {
+        name: "contacts_lookup",
+        description:
+          "Searches Google Contacts by name to find email addresses. Use before creating calendar events when attendee emails are not provided.",
+        schema: contactsLookupSchema,
+      })
     );
   }
 
   if (isToolAvailable("calendar_check_availability", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("calendar_check_availability", input, ctx),
-        {
-          name: "calendar_check_availability",
-          description:
-            "Checks the user's Google Calendar availability for a given time range. Returns busy periods.",
-          schema: calendarCheckAvailabilitySchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("calendar_check_availability", input, ctx), {
+        name: "calendar_check_availability",
+        description:
+          "Checks the user's Google Calendar availability for a given time range. Returns busy periods.",
+        schema: calendarCheckAvailabilitySchema,
+      })
     );
   }
 
   if (isToolAvailable("calendar_list_events", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("calendar_list_events", input, ctx),
-        {
-          name: "calendar_list_events",
-          description: "Lists upcoming events from the user's Google Calendar within a time range.",
-          schema: calendarListEventsSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("calendar_list_events", input, ctx), {
+        name: "calendar_list_events",
+        description: "Lists upcoming events from the user's Google Calendar within a time range.",
+        schema: calendarListEventsSchema,
+      })
     );
   }
 
   if (isToolAvailable("calendar_create_event", ctx)) {
     tools.push(
-      tool(
-        async (input) => executeImmediateTool("calendar_create_event", input, ctx),
-        {
-          name: "calendar_create_event",
-          description:
-            "Creates a new event in the user's Google Calendar. Requires confirmation.",
-          schema: calendarCreateEventSchema,
-        }
-      )
+      tool(async (input) => executeImmediateTool("calendar_create_event", input, ctx), {
+        name: "calendar_create_event",
+        description: "Creates a new event in the user's Google Calendar. Requires confirmation.",
+        schema: calendarCreateEventSchema,
+      })
     );
   }
 

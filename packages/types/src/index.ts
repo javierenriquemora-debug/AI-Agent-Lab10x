@@ -1,4 +1,4 @@
-export type Channel = "web" | "telegram";
+export type Channel = "web" | "telegram" | "scheduled";
 
 export type ToolRisk = "low" | "medium" | "high";
 
@@ -81,4 +81,48 @@ export interface ToolDefinition {
   risk: ToolRisk;
   requires_integration?: string;
   parameters_schema: Record<string, unknown>;
+}
+
+export type ScheduledTaskChannel = "telegram";
+export type ScheduledTaskScheduleType = "one_time" | "recurring";
+export type ScheduledTaskRecurrence = "daily" | "weekly" | "monthly";
+export type ScheduledTaskStatus =
+  | "active"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "paused"
+  | "cancelled";
+
+export interface ScheduledTask {
+  id: string;
+  user_id: string;
+  prompt: string;
+  schedule_type: ScheduledTaskScheduleType;
+  recurrence: ScheduledTaskRecurrence | null;
+  run_at: string;
+  next_run_at: string | null;
+  timezone: string;
+  channel: ScheduledTaskChannel;
+  status: ScheduledTaskStatus;
+  last_executed_at: string | null;
+  last_error: string | null;
+  created_via_session_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ScheduledTaskRunStatus = "running" | "succeeded" | "failed";
+
+export interface ScheduledTaskRun {
+  id: string;
+  scheduled_task_id: string;
+  user_id: string;
+  status: ScheduledTaskRunStatus;
+  started_at: string;
+  finished_at: string | null;
+  error_message: string | null;
+  agent_session_id: string | null;
+  response_excerpt: string | null;
+  triggered_by: "cron" | "manual";
 }

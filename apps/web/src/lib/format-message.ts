@@ -8,6 +8,13 @@
  * Used in the web chat interface and applied to Telegram outgoing messages.
  */
 export function formatMessageToHtml(text: string): string {
+  // If the message already contains HTML tags, preserve it as-is.
+  // This avoids corrupting valid Telegram HTML like <b>...</b> or <code>...</code>
+  // when the text also contains underscores or other markdown-like characters.
+  if (/<\/?[a-z][\s\S]*?>/i.test(text)) {
+    return text;
+  }
+
   return (
     text
       // Bold

@@ -37,6 +37,117 @@ export const TOOL_CATALOG: ToolDefinition[] = [
     },
   },
   {
+    id: "read_file",
+    name: "read_file",
+    description:
+      "Reads a text file inside the repository. Use it when you need to inspect an existing file before making decisions. It returns numbered lines and metadata about the slice that was read.",
+    risk: "low",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Absolute path or path relative to the repository root of the file to read",
+        },
+        offset: {
+          type: "number",
+          description: "Optional line offset. Positive values start at line 1; negative values count from the end",
+        },
+        limit: {
+          type: "number",
+          description: "Optional maximum number of lines to return",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    id: "write_file",
+    name: "write_file",
+    description:
+      "Creates a new text file inside the repository. Use it only when the target file does not exist yet. It returns the created path plus the number of characters and bytes written, or a clear error if the file already exists or the parent folder is missing.",
+    risk: "medium",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Absolute path or path relative to the repository root of the new file to create",
+        },
+        content: {
+          type: "string",
+          description: "Full text content that will be written into the new file",
+        },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    id: "edit_file",
+    name: "edit_file",
+    description:
+      "Edits an existing text file by replacing one exact and unique string. Use it for precise changes when you know the current text to replace. It returns the edited path and number of replacements, or a clear error if the text is missing or ambiguous.",
+    risk: "medium",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Absolute path or path relative to the repository root of the file to edit",
+        },
+        old_string: {
+          type: "string",
+          description: "Exact existing text to replace. It must appear exactly once in the file",
+        },
+        new_string: {
+          type: "string",
+          description: "Replacement text that will be written in place of old_string",
+        },
+      },
+      required: ["path", "old_string", "new_string"],
+    },
+  },
+  {
+    id: "create_scheduled_task",
+    name: "create_scheduled_task",
+    description:
+      "Creates a scheduled task that will re-run a natural-language prompt later through the agent. Use it for reminders, recurring follow-ups and deferred automations. It stores the prompt, first execution time, recurrence and delivery channel.",
+    risk: "medium",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description: "Natural-language instruction that the agent must execute when the task becomes due",
+        },
+        schedule_type: {
+          type: "string",
+          enum: ["one_time", "recurring"],
+          description: "Whether the task runs once or repeats",
+        },
+        run_at: {
+          type: "string",
+          description: "First execution datetime in ISO 8601 format with timezone offset",
+        },
+        recurrence: {
+          type: "string",
+          enum: ["daily", "weekly", "monthly"],
+          description: "Required only when schedule_type is recurring",
+        },
+        timezone: {
+          type: "string",
+          description: "IANA timezone to interpret and describe the schedule. Defaults to America/Bogota",
+        },
+        channel: {
+          type: "string",
+          enum: ["telegram"],
+          description: "Delivery channel for the scheduled execution. Defaults to telegram",
+        },
+      },
+      required: ["prompt", "schedule_type", "run_at"],
+    },
+  },
+  {
     id: "github_list_repos",
     name: "github_list_repos",
     description: "Lists the user's GitHub repositories.",
@@ -130,7 +241,8 @@ export const TOOL_CATALOG: ToolDefinition[] = [
       properties: {
         time_min: {
           type: "string",
-          description: "Start of the first range in ISO 8601 format with timezone offset (e.g. 2026-04-08T08:00:00-05:00)",
+          description:
+            "Start of the first range in ISO 8601 format with timezone offset (e.g. 2026-04-08T08:00:00-05:00)",
         },
         time_max: {
           type: "string",

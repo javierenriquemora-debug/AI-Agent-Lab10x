@@ -5,6 +5,8 @@ import { runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 import {
   injectBashContinuation,
+  injectFileContinuation,
+  injectScheduledTaskDirective,
   injectSchedulingDirective,
   injectSchedulingContinuation,
   injectDateContext,
@@ -85,9 +87,15 @@ export async function POST(request: Request) {
       if (afterBashContinuation !== processedMessage) {
         processedMessage = afterBashContinuation;
       } else {
-        // No active special flow — apply availability date context then directive
-        processedMessage = await injectDateContext(db, session.id, processedMessage, runtime.timezone);
-        processedMessage = injectSchedulingDirective(processedMessage);
+        const afterFileContinuation = await injectFileContinuation(db, session.id, processedMessage);
+        if (afterFileContinuation !== processedMessage) {
+          processedMessage = afterFileContinuation;
+        } else {
+          // No active special flow — apply availability date context then directive
+          processedMessage = injectScheduledTaskDirective(processedMessage);
+          processedMessage = await injectDateContext(db, session.id, processedMessage, runtime.timezone);
+          processedMessage = injectSchedulingDirective(processedMessage);
+        }
       }
     }
 
@@ -103,7 +111,7 @@ export async function POST(request: Request) {
     });
 
     return NextResponse.json({
-      response: result.response,
+      response: result.response ?? "No pude completar la solicitud con suficiente claridad. Intenta reformularla con la ruta y el contenido deseado.",
       pendingConfirmation: result.pendingConfirmation,
       toolCalls: result.toolCalls,
     });

@@ -7,14 +7,16 @@ import {
 } from "@agents/db";
 import { resumeAgent, runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
+import { sendTelegramMessage } from "@/lib/telegram-bot";
 import {
   injectBashContinuation,
+  injectFileContinuation,
+  injectScheduledTaskDirective,
   injectSchedulingDirective,
   injectSchedulingContinuation,
   injectDateContext,
   rejectAllPendingConfirmations,
   resolveDateReferences,
-  markdownToHtml,
   REJECTION_RE,
 } from "@/lib/message-preprocessing";
 
@@ -46,27 +48,6 @@ interface TelegramUpdate {
   };
 }
 
-
-async function sendTelegramMessage(
-  chatId: number,
-  text: string,
-  replyMarkup?: Record<string, unknown>
-) {
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: markdownToHtml(text),
-      parse_mode: "HTML",
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-    }),
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    console.error("Telegram sendMessage failed:", res.status, body);
-  }
-}
 
 /** Telegram sends "/cmd@BotName args" when the user picks a command from the menu. */
 function parseBotCommand(messageText: string): { command: string; args: string } {
@@ -451,8 +432,14 @@ export async function POST(request: Request) {
     if (afterBashContinuation !== text) {
       text = afterBashContinuation;
     } else {
-      text = await injectDateContext(db, session.id, text, runtime.timezone);
-      text = injectSchedulingDirective(text);
+      const afterFileContinuation = await injectFileContinuation(db, session.id, text);
+      if (afterFileContinuation !== text) {
+        text = afterFileContinuation;
+      } else {
+        text = injectScheduledTaskDirective(text);
+        text = await injectDateContext(db, session.id, text, runtime.timezone);
+        text = injectSchedulingDirective(text);
+      }
     }
   }
 
@@ -485,6 +472,11 @@ export async function POST(request: Request) {
       });
     } else if (result.response) {
       await sendTelegramMessage(chatId, result.response);
+    } else {
+      await sendTelegramMessage(
+        chatId,
+        "No pude completar la solicitud con suficiente claridad. Intenta reformularla indicando la ruta destino y si quieres copia exacta o basada en el resumen."
+      );
     }
   } catch (error) {
     console.error("Telegram agent error:", error);

@@ -45,7 +45,9 @@ export async function updateSession(request: NextRequest) {
   const publicPaths = ["/login", "/signup", "/auth/callback"];
   const isPublic = publicPaths.some((p) => pathname.startsWith(p));
   // Telegram calls the webhook without browser cookies; do not force login.
-  const isPublicApi = pathname.startsWith("/api/telegram/webhook");
+  const isPublicApi =
+    pathname.startsWith("/api/telegram/webhook") ||
+    pathname.startsWith("/api/cron/scheduled-tasks");
 
   if (!user && !isPublic && !isPublicApi) {
     const url = request.nextUrl.clone();

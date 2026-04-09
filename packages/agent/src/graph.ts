@@ -277,8 +277,19 @@ async function invokeGraph(
       };
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const result = await (matchingTool as any).invoke(nextToolCall.args);
+    let result: unknown;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      result = await (matchingTool as any).invoke(nextToolCall.args);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unknown tool execution error";
+      result = JSON.stringify({
+        message,
+        failed: true,
+        toolName: nextToolCall.name,
+      });
+    }
     return {
       messages: [
         new ToolMessage({

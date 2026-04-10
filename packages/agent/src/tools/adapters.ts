@@ -12,10 +12,12 @@ import type {
 } from "@agents/types";
 import { TOOL_CATALOG } from "./catalog";
 import {
+  cancelScheduledTaskById,
   createScheduledTask,
   createToolCall,
   getTelegramAccountByUserId,
   getToolCallById,
+  listScheduledTasksForUser,
   updateToolCallStatus,
 } from "@agents/db";
 import {
@@ -223,6 +225,26 @@ const createScheduledTaskSchema = z
     }
   });
 
+const listScheduledTasksSchema = z.object({
+  status: z
+    .enum(["active", "processing", "completed", "failed", "paused", "cancelled", "all"])
+    .optional()
+    .default("active")
+    .describe("Optional status filter. Defaults to active."),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(100)
+    .optional()
+    .default(20)
+    .describe("Maximum number of tasks to return"),
+});
+
+const cancelScheduledTaskSchema = z.object({
+  task_id: z.string().uuid().describe("The exact scheduled task id to cancel"),
+});
+
 function getRepoRoot(): string {
   const candidates = [
     process.cwd(),
@@ -290,6 +312,22 @@ function computeNextRunAt(
   }
 
   return current.toISOString();
+}
+
+function formatScheduledTaskDateLabel(
+  isoDate: string | null,
+  timezone: string
+): string | null {
+  if (!isoDate) return null;
+
+  const parsed = new Date(isoDate);
+  if (Number.isNaN(parsed.getTime())) return isoDate;
+
+  return parsed.toLocaleString("es-CO", {
+    timeZone: timezone,
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 async function executeReadFileTool(
@@ -498,12 +536,78 @@ async function executeCreateScheduledTaskTool(
     createdViaSessionId: ctx.sessionId,
   });
 
+  const runAtLabel = formatScheduledTaskDateLabel(input.run_at, input.timezone);
+  const nextRunAtLabel = formatScheduledTaskDateLabel(nextRunAt, input.timezone);
+
   return {
     message:
       input.schedule_type === "one_time"
-        ? `Tarea programada creada para ejecutarse una vez el ${input.run_at}.`
-        : `Tarea programada recurrente creada. Primera ejecución: ${input.run_at}. Frecuencia: ${input.recurrence}.`,
-    task,
+        ? `Tarea programada creada para ejecutarse una vez el ${runAtLabel ?? input.run_at}.`
+        : `Tarea programada recurrente creada. Primera ejecución: ${runAtLabel ?? input.run_at}. Frecuencia: ${input.recurrence}.`,
+    task: {
+      ...task,
+      run_at_label: runAtLabel,
+      next_run_at_label: nextRunAtLabel,
+    },
+  };
+}
+
+async function executeListScheduledTasksTool(
+  rawInput: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolExecutionResult> {
+  const input = listScheduledTasksSchema.parse(rawInput);
+  const tasks = await listScheduledTasksForUser(ctx.db, {
+    userId: ctx.userId,
+    status: input.status,
+    limit: input.limit,
+  });
+
+  const summarizedTasks = tasks.map((task, index) => ({
+    reference_number: index + 1,
+    id: task.id,
+    status: task.status,
+    schedule_type: task.schedule_type,
+    recurrence: task.recurrence,
+    run_at: task.run_at,
+    run_at_label: formatScheduledTaskDateLabel(task.run_at, task.timezone),
+    next_run_at: task.next_run_at,
+    next_run_at_label: formatScheduledTaskDateLabel(task.next_run_at, task.timezone),
+    timezone: task.timezone,
+    channel: task.channel,
+    prompt_preview:
+      task.prompt.length > 140 ? `${task.prompt.slice(0, 140)}...` : task.prompt,
+  }));
+
+  return {
+    message:
+      summarizedTasks.length > 0
+        ? `Se encontraron ${summarizedTasks.length} tarea(s) programada(s).`
+        : "No se encontraron tareas programadas con ese filtro.",
+    tasks: summarizedTasks,
+    count: summarizedTasks.length,
+    statusFilter: input.status,
+  };
+}
+
+async function executeCancelScheduledTaskTool(
+  rawInput: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolExecutionResult> {
+  const input = cancelScheduledTaskSchema.parse(rawInput);
+  const task = await cancelScheduledTaskById(ctx.db, ctx.userId, input.task_id);
+
+  return {
+    message: `La tarea programada "${input.task_id}" fue cancelada correctamente.`,
+    task: {
+      id: task.id,
+      status: task.status,
+      schedule_type: task.schedule_type,
+      recurrence: task.recurrence,
+      next_run_at: task.next_run_at,
+      next_run_at_label: formatScheduledTaskDateLabel(task.next_run_at, task.timezone),
+      prompt_preview: task.prompt.length > 140 ? `${task.prompt.slice(0, 140)}...` : task.prompt,
+    },
   };
 }
 
@@ -790,6 +894,12 @@ function routeToolExecution(
   if (toolName === "create_scheduled_task") {
     return executeCreateScheduledTaskTool(input, ctx);
   }
+  if (toolName === "list_scheduled_tasks") {
+    return executeListScheduledTasksTool(input, ctx);
+  }
+  if (toolName === "cancel_scheduled_task") {
+    return executeCancelScheduledTaskTool(input, ctx);
+  }
   if (toolName === "read_file") {
     return executeReadFileTool(input);
   }
@@ -917,12 +1027,25 @@ export function buildPendingToolReview(
     const parsed = createScheduledTaskSchema.parse(input);
     const recurrenceText =
       parsed.schedule_type === "recurring" ? ` con frecuencia ${parsed.recurrence}` : "";
+    const runAtLabel = formatScheduledTaskDateLabel(parsed.run_at, parsed.timezone);
     return {
       toolName,
       input,
       message:
-        `Confirma si deseas crear una tarea programada para ${parsed.run_at}${recurrenceText}. ` +
+        `Confirma si deseas crear una tarea programada para ${runAtLabel ?? parsed.run_at}${recurrenceText}. ` +
         `Canal: ${parsed.channel}. Prompt: ${parsed.prompt.slice(0, 160)}${parsed.prompt.length > 160 ? "..." : ""}`,
+      allowedDecisions: ["approve", "reject"],
+    };
+  }
+
+  if (toolName === "cancel_scheduled_task") {
+    const parsed = cancelScheduledTaskSchema.parse(input);
+    return {
+      toolName,
+      input,
+      message:
+        `Confirma si deseas cancelar la tarea programada con id "${parsed.task_id}". ` +
+        `No volverá a ejecutarse mientras permanezca cancelada.`,
       allowedDecisions: ["approve", "reject"],
     };
   }
@@ -997,6 +1120,28 @@ export function buildLangChainTools(ctx: ToolContext) {
         description:
           "Creates a scheduled task that will re-run a natural-language prompt later through the agent. Use it for reminders, recurring follow-ups and deferred automations. Defaults to Telegram delivery.",
         schema: createScheduledTaskSchema,
+      })
+    );
+  }
+
+  if (isToolAvailable("list_scheduled_tasks", ctx)) {
+    tools.push(
+      tool(async (input) => executeImmediateTool("list_scheduled_tasks", input, ctx), {
+        name: "list_scheduled_tasks",
+        description:
+          "Lists the user's scheduled tasks. Returns ids, status, schedule type, recurrence, next execution time and a short prompt preview.",
+        schema: listScheduledTasksSchema,
+      })
+    );
+  }
+
+  if (isToolAvailable("cancel_scheduled_task", ctx)) {
+    tools.push(
+      tool(async (input) => executeImmediateTool("cancel_scheduled_task", input, ctx), {
+        name: "cancel_scheduled_task",
+        description:
+          "Cancels a scheduled task so it stops running in the future. Use only when you already know the exact task_id.",
+        schema: cancelScheduledTaskSchema,
       })
     );
   }

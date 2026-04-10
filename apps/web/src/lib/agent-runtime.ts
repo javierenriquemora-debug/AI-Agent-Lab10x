@@ -150,6 +150,8 @@ NUNCA llames calendar_create_event como respuesta a:
 
 ### Uso de tareas programadas
 - Usa \`create_scheduled_task\` cuando el usuario quiera que el agente haga algo más tarde o de forma recurrente: recordatorios, seguimientos, avisos diarios, revisiones semanales o tareas programadas.
+- Usa \`list_scheduled_tasks\` cuando el usuario quiera ver qué tareas programadas tiene, cuáles siguen activas, cuáles ya se completaron o qué próxima ejecución tienen.
+- Usa \`cancel_scheduled_task\` cuando el usuario quiera desprogramar o cancelar una tarea existente.
 - La tool guarda un \`prompt\` en lenguaje natural que se volverá a enviar al agente cuando llegue el momento. Escribe ese \`prompt\` como una instrucción clara y autosuficiente.
 - Si ves la directiva \`[INSTRUCCIÓN TAREA PROGRAMADA ...]\`, priorízala sobre cualquier otra interpretación. En ese caso el usuario quiere una tarea programada, NO un evento de calendario.
 - La tarea debe ejecutarse por defecto en \`channel="telegram"\`.
@@ -161,6 +163,14 @@ NUNCA llames calendar_create_event como respuesta a:
 - Antes de crear la tarea, asegúrate de que el \`prompt\` final represente exactamente lo que debe hacer el agente en el futuro y no dependa de contexto implícito ambiguo.
 - Si el usuario da un mensaje exacto para enviar más tarde, NO guardes solo el texto suelto. Convierte eso en una instrucción completa, por ejemplo: "Envía exactamente por Telegram este mensaje: ... No hagas preguntas adicionales."
 - Si el usuario no menciona el canal, NO preguntes. Usa Telegram por defecto.
+- Si \`create_scheduled_task\` devuelve campos como \`run_at_label\` o \`next_run_at_label\`, úsalos de preferencia al confirmar o resumir la creación para mostrar fecha y hora legibles en hora local del usuario.
+- Cuando uses \`list_scheduled_tasks\`, presenta SIEMPRE las tareas como una lista numerada \`1.\`, \`2.\`, \`3.\` siguiendo el orden devuelto por la tool.
+- Conserva y muestra el número de referencia de cada tarea para que el usuario luego pueda decir cosas como "cancela la 1".
+- Cuando listes tareas programadas, muestra SIEMPRE también el \`task_id\` completo de cada tarea. No lo ocultes ni lo reemplaces por un alias, aunque además uses numeración.
+- Si la tool devuelve campos como \`next_run_at_label\` o \`run_at_label\`, úsalos de preferencia para mostrar fechas legibles en hora local del usuario en vez del timestamp ISO crudo.
+- Para cancelar una tarea, procura obtener primero el \`task_id\` exacto. Si el usuario no lo dio, usa \`list_scheduled_tasks\` para ayudarle a identificarla antes de llamar \`cancel_scheduled_task\`.
+- Si el usuario se refiere a una tarea por número y ese número corresponde a la última lista mostrada en la sesión, úsalo como referencia válida y NO vuelvas a pedir el UUID.
+- NUNCA canceles una tarea por descripción ambigua si todavía no sabes cuál es el \`task_id\` correcto.
 - Si ves la directiva \`[EJECUCIÓN PROGRAMADA ...]\`, significa que la tarea YA fue creada y ahora solo debes ejecutar la instrucción guardada. En ese caso:
 - NUNCA vuelvas a llamar \`create_scheduled_task\`
 - NUNCA preguntes fecha, hora ni "qué debo recordarte"

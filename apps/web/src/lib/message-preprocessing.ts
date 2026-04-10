@@ -141,8 +141,14 @@ const FILE_PATH_RE =
   /([A-Za-z0-9._/-]+(?:\\[A-Za-z0-9._-]+)*(?:\/[A-Za-z0-9._-]+)*\.[A-Za-z0-9._-]+)/g;
 const SCHEDULED_TASK_INTENT_RE =
   /\b(tarea(s)? programada(s)?|recu[eé]rdame|recu[eé]rdame|av[ií]same|notif[ií]came|recordarme|recordatorio|cada\s+(d[ií]a|semana|mes)|todos?\s+los\s+d[ií]as|semanal|mensual)\b/i;
+const SCHEDULED_TASK_LIST_RE =
+  /\b(mu[eé]strame|mostrar|dame|lista|listar|cu[aá]les|cu[aá]l(es)?\s+tengo|ver)\b[\s\S]*\b(tarea(s)? programada(s)?|recordatorio(s)?)\b/i;
+const SCHEDULED_TASK_CANCEL_BY_ID_RE =
+  /\b(cancela|cancelar|elimina|eliminar|desprograma|desprogramar|borra|borrar|quita|quitar)\b[\s\S]*?\b([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\b/i;
 const EXACT_MESSAGE_RE =
   /(?:mensaje|texto)\s*:?\s*["“]([^"”]+)["”]|env[ií]ame exactamente(?:\s+por telegram)?\s+este mensaje\s*:?\s*["“]([^"”]+)["”]/i;
+const SCHEDULED_TASK_NUMBER_ACTION_RE =
+  /\b(cancela|cancelar|elimina|eliminar|desprograma|desprogramar|borra|borrar|quita|quitar)\b[\s\S]*?\b(?:tarea\s+)?(?:n[uú]mero\s+)?#?(\d{1,2})\b/i;
 
 /**
  * When a follow-up message has no explicit date/day but either:
@@ -360,6 +366,22 @@ export async function injectFileContinuation(
 // ─── Scheduled task directives ───────────────────────────────────────────────
 
 export function injectScheduledTaskDirective(text: string): string {
+  const cancelByIdMatch = text.match(SCHEDULED_TASK_CANCEL_BY_ID_RE);
+  if (cancelByIdMatch) {
+    const taskId = cancelByIdMatch[2];
+    return (
+      `[INSTRUCCIÓN GESTIÓN TAREA PROGRAMADA. El usuario quiere cancelar una tarea programada específica. ` +
+      `Llama cancel_scheduled_task AHORA con task_id="${taskId}". No pidas el UUID de nuevo.]\n\n${text}`
+    );
+  }
+
+  if (SCHEDULED_TASK_LIST_RE.test(text)) {
+    return (
+      `[INSTRUCCIÓN GESTIÓN TAREA PROGRAMADA. El usuario quiere ver su lista de tareas programadas. ` +
+      `Llama list_scheduled_tasks AHORA. Si el usuario no especifica estado, usa el filtro por defecto de tareas activas.]\n\n${text}`
+    );
+  }
+
   if (!SCHEDULED_TASK_INTENT_RE.test(text)) return text;
 
   const exactMessageMatch = text.match(EXACT_MESSAGE_RE);
@@ -387,6 +409,58 @@ export function buildScheduledExecutionMessage(prompt: string): string {
     `Ejecuta directamente la instrucción guardada. ` +
     `Si la instrucción consiste en enviar un mensaje, envíalo sin pedir aclaraciones. ` +
     `Solo haz una pregunta si la instrucción es realmente imposible de ejecutar tal como está escrita.]\n\n${prompt}`
+  );
+}
+
+export async function injectScheduledTaskReferenceContinuation(
+  db: DbClient,
+  sessionId: string,
+  text: string
+): Promise<string> {
+  const match = text.match(SCHEDULED_TASK_NUMBER_ACTION_RE);
+  if (!match) return text;
+
+  const requestedIndex = Number(match[2]);
+  if (!Number.isInteger(requestedIndex) || requestedIndex <= 0) return text;
+
+  const { data: latestListCall } = await db
+    .from("tool_calls")
+    .select("result_json")
+    .eq("session_id", sessionId)
+    .eq("tool_name", "list_scheduled_tasks")
+    .eq("status", "executed")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const tasks = (((latestListCall?.result_json as Record<string, unknown> | null) ?? {})
+    .tasks ?? []) as Array<Record<string, unknown>>;
+
+  if (tasks.length === 0) {
+    return (
+      `[REFERENCIA TAREA PROGRAMADA. El usuario quiere actuar sobre la tarea número ${requestedIndex}, ` +
+      `pero no hay una lista reciente confiable en esta sesión. ` +
+      `Primero llama list_scheduled_tasks para mostrar las tareas activas y luego pídele que elija de nuevo.]\n\n${text}`
+    );
+  }
+
+  const selectedTask = tasks.find(
+    (task) => Number(task.reference_number ?? 0) === requestedIndex
+  );
+
+  if (!selectedTask || typeof selectedTask.id !== "string") {
+    return (
+      `[REFERENCIA TAREA PROGRAMADA. El usuario se refiere a la tarea número ${requestedIndex}, ` +
+      `pero esa posición no existe en la última lista mostrada. ` +
+      `Explícale que elija un número válido de la lista más reciente o vuelve a mostrarla con list_scheduled_tasks.]\n\n${text}`
+    );
+  }
+
+  return (
+    `[REFERENCIA TAREA PROGRAMADA. El usuario se refiere a la tarea número ${requestedIndex} ` +
+    `de la última lista mostrada. Esa tarea corresponde a task_id="${selectedTask.id}". ` +
+    `El usuario quiere cancelarla o desprogramarla. ` +
+    `Llama cancel_scheduled_task con task_id="${selectedTask.id}" sin pedir el UUID nuevamente.]\n\n${text}`
   );
 }
 

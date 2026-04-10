@@ -19,6 +19,12 @@ interface CreateScheduledTaskInput {
   createdViaSessionId?: string | null;
 }
 
+interface ListScheduledTasksInput {
+  userId: string;
+  status?: ScheduledTask["status"] | "all";
+  limit?: number;
+}
+
 export async function createScheduledTask(
   db: DbClient,
   input: CreateScheduledTaskInput
@@ -60,6 +66,78 @@ export async function listDueScheduledTasks(
 
   if (error) throw error;
   return (data ?? []) as ScheduledTask[];
+}
+
+export async function listScheduledTasksForUser(
+  db: DbClient,
+  input: ListScheduledTasksInput
+) {
+  const limit = Math.min(Math.max(input.limit ?? 20, 1), 100);
+  let query = db
+    .from("scheduled_tasks")
+    .select("*")
+    .eq("user_id", input.userId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (input.status && input.status !== "all") {
+    query = query.eq("status", input.status);
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+  return (data ?? []) as ScheduledTask[];
+}
+
+export async function cancelScheduledTaskById(
+  db: DbClient,
+  userId: string,
+  scheduledTaskId: string
+) {
+  const { data: existing, error: fetchError } = await db
+    .from("scheduled_tasks")
+    .select("*")
+    .eq("id", scheduledTaskId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (fetchError) throw fetchError;
+  if (!existing) {
+    throw new Error(`No se encontró una tarea programada con id "${scheduledTaskId}".`);
+  }
+
+  if (existing.status === "cancelled") {
+    throw new Error(`La tarea "${scheduledTaskId}" ya está cancelada.`);
+  }
+
+  if (existing.status === "completed") {
+    throw new Error(`La tarea "${scheduledTaskId}" ya fue completada y no se puede cancelar.`);
+  }
+
+  if (existing.status === "failed") {
+    throw new Error(`La tarea "${scheduledTaskId}" ya falló. Revísala antes de intentar cancelarla.`);
+  }
+
+  const { data, error } = await db
+    .from("scheduled_tasks")
+    .update({
+      status: "cancelled",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", scheduledTaskId)
+    .eq("user_id", userId)
+    .in("status", ["active", "paused"])
+    .select("*")
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) {
+    throw new Error(
+      `No se pudo cancelar la tarea "${scheduledTaskId}" porque ya no estaba activa o pausada.`
+    );
+  }
+
+  return data as ScheduledTask;
 }
 
 export async function claimScheduledTask(

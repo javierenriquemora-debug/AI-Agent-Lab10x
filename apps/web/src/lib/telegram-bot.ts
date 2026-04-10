@@ -7,9 +7,14 @@ export async function sendTelegramMessage(
   text: string,
   replyMarkup?: Record<string, unknown>
 ) {
+  const normalizedText =
+    typeof text === "string" && text.trim().length > 0
+      ? text.trim()
+      : "No pude completar la solicitud con suficiente claridad. Intenta reformularla.";
+
   const payload = {
     chat_id: chatId,
-    text: markdownToHtml(text),
+    text: markdownToHtml(normalizedText),
     parse_mode: "HTML",
     ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
   };
@@ -27,7 +32,7 @@ export async function sendTelegramMessage(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
-        text,
+        text: normalizedText,
         ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       }),
     });

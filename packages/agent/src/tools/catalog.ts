@@ -148,6 +148,45 @@ export const TOOL_CATALOG: ToolDefinition[] = [
     },
   },
   {
+    id: "list_scheduled_tasks",
+    name: "list_scheduled_tasks",
+    description:
+      "Lists the user's scheduled tasks saved in the system. Use it when the user wants to see upcoming, active, paused, completed or cancelled scheduled tasks. It returns task ids, status, schedule type, recurrence, next execution times and a short prompt preview.",
+    risk: "low",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["active", "processing", "completed", "failed", "paused", "cancelled", "all"],
+          description: "Optional filter by task status. Defaults to active.",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of tasks to return. Defaults to 20, max 100.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    id: "cancel_scheduled_task",
+    name: "cancel_scheduled_task",
+    description:
+      "Cancels a scheduled task so it stops running in the future. Use it only when the user clearly wants to deschedule a specific task and you already know its task_id.",
+    risk: "high",
+    parameters_schema: {
+      type: "object",
+      properties: {
+        task_id: {
+          type: "string",
+          description: "The exact scheduled task id to cancel",
+        },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
     id: "github_list_repos",
     name: "github_list_repos",
     description: "Lists the user's GitHub repositories.",

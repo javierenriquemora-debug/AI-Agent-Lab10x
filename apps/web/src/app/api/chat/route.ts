@@ -6,6 +6,7 @@ import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 import {
   injectBashContinuation,
   injectFileContinuation,
+  injectScheduledTaskReferenceContinuation,
   injectScheduledTaskDirective,
   injectSchedulingDirective,
   injectSchedulingContinuation,
@@ -91,10 +92,19 @@ export async function POST(request: Request) {
         if (afterFileContinuation !== processedMessage) {
           processedMessage = afterFileContinuation;
         } else {
-          // No active special flow — apply availability date context then directive
-          processedMessage = injectScheduledTaskDirective(processedMessage);
-          processedMessage = await injectDateContext(db, session.id, processedMessage, runtime.timezone);
-          processedMessage = injectSchedulingDirective(processedMessage);
+          const afterTaskReference = await injectScheduledTaskReferenceContinuation(
+            db,
+            session.id,
+            processedMessage
+          );
+          if (afterTaskReference !== processedMessage) {
+            processedMessage = afterTaskReference;
+          } else {
+            // No active special flow — apply availability date context then directive
+            processedMessage = injectScheduledTaskDirective(processedMessage);
+            processedMessage = await injectDateContext(db, session.id, processedMessage, runtime.timezone);
+            processedMessage = injectSchedulingDirective(processedMessage);
+          }
         }
       }
     }
@@ -110,8 +120,13 @@ export async function POST(request: Request) {
       integrationSecrets: runtime.integrationSecrets,
     });
 
+    const normalizedResponse =
+      typeof result.response === "string" && result.response.trim().length > 0
+        ? result.response.trim()
+        : "No pude completar la solicitud con suficiente claridad. Intenta reformularla con más detalle.";
+
     return NextResponse.json({
-      response: result.response ?? "No pude completar la solicitud con suficiente claridad. Intenta reformularla con la ruta y el contenido deseado.",
+      response: normalizedResponse,
       pendingConfirmation: result.pendingConfirmation,
       toolCalls: result.toolCalls,
     });

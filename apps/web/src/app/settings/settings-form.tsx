@@ -30,6 +30,8 @@ const TOOL_IDS = [
   "write_file",
   "edit_file",
   "create_scheduled_task",
+  "list_scheduled_tasks",
+  "cancel_scheduled_task",
 ];
 
 export function SettingsForm({

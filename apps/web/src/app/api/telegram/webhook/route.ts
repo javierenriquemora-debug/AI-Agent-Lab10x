@@ -11,6 +11,7 @@ import { sendTelegramMessage } from "@/lib/telegram-bot";
 import {
   injectBashContinuation,
   injectFileContinuation,
+  injectScheduledTaskReferenceContinuation,
   injectScheduledTaskDirective,
   injectSchedulingDirective,
   injectSchedulingContinuation,
@@ -436,9 +437,18 @@ export async function POST(request: Request) {
       if (afterFileContinuation !== text) {
         text = afterFileContinuation;
       } else {
-        text = injectScheduledTaskDirective(text);
-        text = await injectDateContext(db, session.id, text, runtime.timezone);
-        text = injectSchedulingDirective(text);
+        const afterTaskReference = await injectScheduledTaskReferenceContinuation(
+          db,
+          session.id,
+          text
+        );
+        if (afterTaskReference !== text) {
+          text = afterTaskReference;
+        } else {
+          text = injectScheduledTaskDirective(text);
+          text = await injectDateContext(db, session.id, text, runtime.timezone);
+          text = injectSchedulingDirective(text);
+        }
       }
     }
   }
@@ -475,7 +485,7 @@ export async function POST(request: Request) {
     } else {
       await sendTelegramMessage(
         chatId,
-        "No pude completar la solicitud con suficiente claridad. Intenta reformularla indicando la ruta destino y si quieres copia exacta o basada en el resumen."
+        "No pude completar la solicitud con suficiente claridad. Intenta reformularla con más detalle."
       );
     }
   } catch (error) {

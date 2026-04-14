@@ -14,6 +14,11 @@ interface RequestBody {
   action?: "approve" | "reject";
 }
 
+function getCheckpointThreadId(args: Record<string, unknown> | null | undefined): string | undefined {
+  const value = args?.__checkpoint_thread_id;
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
 export async function POST(
   request: Request,
   context: { params: Promise<{ toolCallId: string }> }
@@ -65,6 +70,7 @@ export async function POST(
           db,
           userId: user.id,
           sessionId: rejectedToolCall.session_id,
+          checkpointThreadId: getCheckpointThreadId(rejectedToolCall.arguments_json),
           systemPrompt: runtime.systemPrompt,
           enabledTools: runtime.enabledTools,
           integrations: runtime.integrations,
@@ -107,6 +113,7 @@ export async function POST(
         db,
         userId: user.id,
         sessionId: approvedToolCall.session_id,
+        checkpointThreadId: getCheckpointThreadId(approvedToolCall.arguments_json),
         systemPrompt: runtime.systemPrompt,
         enabledTools: runtime.enabledTools,
         integrations: runtime.integrations,

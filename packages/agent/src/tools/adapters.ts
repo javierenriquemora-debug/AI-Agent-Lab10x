@@ -40,6 +40,7 @@ export interface PendingConfirmation {
   toolCallId: string;
   toolName: string;
   message: string;
+  checkpointThreadId?: string;
 }
 
 interface ToolExecutionResult {
@@ -1060,13 +1061,23 @@ export function buildPendingToolReview(
 
 export async function createPendingToolCallRecord(
   ctx: ToolContext,
-  review: PendingToolReview
+  review: PendingToolReview,
+  checkpointThreadId?: string
 ): Promise<PendingConfirmation> {
-  const record = await createToolCall(ctx.db, ctx.sessionId, review.toolName, review.input, true);
+  const record = await createToolCall(
+    ctx.db,
+    ctx.sessionId,
+    review.toolName,
+    checkpointThreadId
+      ? { ...review.input, __checkpoint_thread_id: checkpointThreadId }
+      : review.input,
+    true
+  );
   return {
     toolCallId: record.id,
     toolName: review.toolName,
     message: review.message,
+    checkpointThreadId,
   };
 }
 

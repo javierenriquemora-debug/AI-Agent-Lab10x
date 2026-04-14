@@ -31,6 +31,8 @@ export async function rejectAllPendingConfirmations(
 
 export const SCHEDULE_INTENT_RE =
   /\b(agenda|agendar|programa|programar|crea(r)?\s+(un\s+)?(evento|reuni[oó]n|espacio|cita)|reuni[oó]n|meeting)\b/i;
+export const AGENDA_QUERY_RE =
+  /\b(c[oó]mo\s+estoy\s+de\s+agenda|mi\s+agenda|qu[eé]\s+tengo\s+en\s+la\s+agenda|qu[eé]\s+tengo\s+ma[ñn]ana|revis[ae]\s+mi\s+agenda|m[ué]strame\s+mi\s+agenda|disponibilidad|espacios\s+disponibles|eventos?\s+de)\b/i;
 
 export const HOUR_REF_RE =
   /\b(a las\s+\d|am\b|pm\b|\d{1,2}:\d{2}|\d{1,2}\s*(am|pm))/i;
@@ -64,6 +66,8 @@ export const CONTACT_QUESTION_RE =
  */
 export const CONTACT_OPTIONS_RE =
   /He encontrado múltiples|¿Cuál deseas usar|cuál es el correo correcto|confirma cuál|múltiples contactos|múltiples correos/i;
+const CONTACT_SELECTION_REPLY_RE =
+  /^(?:\d{1,2}|el primero|la primera|el segundo|la segunda|el tercero|la tercera|ese|esa|la de kikes|la de incusan|la de hotmail)$/i;
 
 /**
  * Detects clear rejection of a pending action.
@@ -71,6 +75,10 @@ export const CONTACT_OPTIONS_RE =
  */
 export const REJECTION_RE =
   /^(no|nop|nope|nel)$|no\s+(quiero|proceder|crear|agendar|gracias)|cancelar?|cancela(r|do)?|olvida(r|lo)?|d[eé]jalo|no\s+lo\s+hagas|no\s+proceed/i;
+
+function hasSchedulingCreationIntent(text: string): boolean {
+  return SCHEDULE_INTENT_RE.test(text) && !AGENDA_QUERY_RE.test(text);
+}
 
 // ─── Date reference resolver ─────────────────────────────────────────────────
 
@@ -471,7 +479,7 @@ export async function injectScheduledTaskReferenceContinuation(
  * prepends an explicit directive so the model calls the right tools immediately.
  */
 export function injectSchedulingDirective(text: string): string {
-  const hasScheduleIntent = SCHEDULE_INTENT_RE.test(text);
+  const hasScheduleIntent = hasSchedulingCreationIntent(text);
   const hasEmail = EMAIL_RE.test(text);
   const hasPersonName = PERSON_NAME_RE.test(text);
   const hasHour = HOUR_REF_RE.test(text);
@@ -518,7 +526,7 @@ export async function injectSchedulingContinuation(
   sessionId: string,
   text: string
 ): Promise<string> {
-  if (SCHEDULE_INTENT_RE.test(text)) return text;
+  if (hasSchedulingCreationIntent(text)) return text;
 
   // ── 1. Pending confirmation (highest priority) ────────────────────────────
   const { data: pendingCalls } = await db
@@ -551,12 +559,29 @@ export async function injectSchedulingContinuation(
 
   const lastAssistant = messages.find((m) => m.role === "assistant");
   const lastAssistantContent = (lastAssistant?.content as string) ?? "";
+  const normalizedText = text.trim();
+
+  const chronological = [...messages].reverse();
+  let flowStartIdx = -1;
+  for (let i = chronological.length - 1; i >= 0; i--) {
+    const m = chronological[i];
+    const raw = (m.content as string).replace(/^\[[\s\S]*?\]\n\n/, "");
+    if (m.role === "user" && hasSchedulingCreationIntent(raw)) {
+      flowStartIdx = i;
+      break;
+    }
+  }
+
+  const hasRecentSchedulingFlow = flowStartIdx !== -1;
 
   // ── 3. Contact-selection guard ───────────────────────────────────────────
   // If the last assistant message was presenting contact options, the user is
   // selecting a contact — NOT requesting an event. Inject an explicit block so
   // the LLM confirms the selection without calling calendar_create_event.
-  if (CONTACT_OPTIONS_RE.test(lastAssistantContent)) {
+  if (
+    CONTACT_OPTIONS_RE.test(lastAssistantContent) &&
+    CONTACT_SELECTION_REPLY_RE.test(normalizedText)
+  ) {
     // Extract the numbered options from the last assistant message so the LLM
     // knows exactly which contact each number refers to (avoids old-context confusion).
     const optionLines = lastAssistantContent.match(/\d+\.\s+[^\n]+/g) ?? [];
@@ -590,7 +615,7 @@ export async function injectSchedulingContinuation(
   }
 
   // ── 5. Not in a scheduling flow → safe to pass through ───────────────────
-  if (!SCHEDULING_FLOW_RE.test(lastAssistantContent)) {
+  if (!SCHEDULING_FLOW_RE.test(lastAssistantContent) && !hasRecentSchedulingFlow) {
     // Contact question outside any flow — force a fresh tool call, never use history
     if (CONTACT_QUESTION_RE.test(text)) {
       return (
@@ -610,18 +635,6 @@ export async function injectSchedulingContinuation(
       `[FLUJO DE AGENDAMIENTO ACTIVO. El usuario hace una pregunta sobre un contacto: "${text}". ` +
       `Respóndela usando contacts_lookup. NO llames calendar_create_event todavía.]\n\n${text}`
     );
-  }
-
-  // Find the start of the current scheduling flow
-  const chronological = [...messages].reverse();
-  let flowStartIdx = -1;
-  for (let i = chronological.length - 1; i >= 0; i--) {
-    const m = chronological[i];
-    const raw = (m.content as string).replace(/^\[[\s\S]*?\]\n\n/, "");
-    if (m.role === "user" && SCHEDULE_INTENT_RE.test(raw)) {
-      flowStartIdx = i;
-      break;
-    }
   }
 
   if (flowStartIdx === -1) return text;

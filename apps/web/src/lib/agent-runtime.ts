@@ -82,10 +82,13 @@ IMPORTANTE: Telegram usa HTML, NO markdown. Esto es obligatorio.
 - Si ves asteriscos en tu respuesta anterior, corrígelos en la siguiente.
 - Usa emojis como marcadores visuales.
 - Al listar eventos de calendario usa este formato:
+  📆 <b>Día, fecha</b>
   📅 <b>Nombre del evento</b>
-  🕐 HH:MM - HH:MM
+  🕐 HH:MM - HH:MM (o "Todo el día" si aplica)
   📍 Sala/Ubicación (solo si aplica)
   👥 Asistentes: Nombre1, Nombre2 (solo si hay asistentes)
+- Al responder consultas como "cómo estoy de agenda" o "qué tengo mañana", muestra SIEMPRE cada evento con marca explícita de fecha y hora. No uses listas con asteriscos crudos.
+- Si un evento viene con rango de fechas o es de todo el día, muéstralo con una línea de fecha clara y una línea de hora clara para que se entienda rápido.
 - Para disponibilidad: ✅ espacios libres, 🔴 bloques ocupados.
 - No incluyas URLs largas de Google Calendar.
 - Si hay muchos eventos, agrúpalos por día: 📆 <b>Día, fecha</b>

@@ -2,36 +2,38 @@ import { ChatOpenAI } from "@langchain/openai";
 
 type LlmProvider = "openrouter" | "gemini";
 
-function getProvider(): LlmProvider {
-  const provider = (process.env.LLM_PROVIDER ?? "openrouter").toLowerCase();
+function normalizeProvider(value?: string | null): LlmProvider {
+  const provider = (value ?? "openrouter").toLowerCase();
   return provider === "gemini" ? "gemini" : "openrouter";
 }
 
-export function createChatModel() {
-  const provider = getProvider();
+function getProvider(): LlmProvider {
+  return normalizeProvider(process.env.LLM_PROVIDER);
+}
 
-  if (provider === "gemini") {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error("Missing GEMINI_API_KEY");
+function createGeminiModel(modelName: string, temperature: number) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("Missing GEMINI_API_KEY");
 
-    return new ChatOpenAI({
-      modelName: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
-      temperature: 0.3,
-      configuration: {
-        // Gemini exposes an OpenAI-compatible endpoint, which lets us keep
-        // the same LangChain model interface and tool-calling flow.
-        baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
-      },
-      apiKey,
-    });
-  }
+  return new ChatOpenAI({
+    modelName,
+    temperature,
+    configuration: {
+      // Gemini exposes an OpenAI-compatible endpoint, which lets us keep
+      // the same LangChain model interface and tool-calling flow.
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+    },
+    apiKey,
+  });
+}
 
+function createOpenRouterModel(modelName: string, temperature: number) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("Missing OPENROUTER_API_KEY");
 
   return new ChatOpenAI({
-    modelName: process.env.OPENROUTER_MODEL ?? "openai/gpt-4o-mini",
-    temperature: 0.3,
+    modelName,
+    temperature,
     configuration: {
       baseURL: "https://openrouter.ai/api/v1",
       defaultHeaders: {
@@ -40,4 +42,42 @@ export function createChatModel() {
     },
     apiKey,
   });
+}
+
+export function createChatModel() {
+  const provider = getProvider();
+  if (provider === "gemini") {
+    return createGeminiModel(process.env.GEMINI_MODEL ?? "gemini-2.5-flash", 0.3);
+  }
+
+  return createOpenRouterModel(
+    process.env.OPENROUTER_MODEL ?? "openai/gpt-4o-mini",
+    0.3
+  );
+}
+
+export function createCompactionModel() {
+  const provider = normalizeProvider(
+    process.env.COMPACTION_LLM_PROVIDER ?? process.env.LLM_PROVIDER
+  );
+
+  try {
+    if (provider === "gemini") {
+      return createGeminiModel(
+        process.env.GEMINI_COMPACTION_MODEL ??
+          process.env.GEMINI_MODEL ??
+          "gemini-2.5-flash",
+        0.1
+      );
+    }
+
+    return createOpenRouterModel(
+      process.env.OPENROUTER_COMPACTION_MODEL ??
+        process.env.OPENROUTER_MODEL ??
+        "openai/gpt-4o-mini",
+      0.1
+    );
+  } catch {
+    return createChatModel();
+  }
 }

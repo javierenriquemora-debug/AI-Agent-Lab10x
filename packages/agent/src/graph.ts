@@ -1,4 +1,5 @@
 import { StateGraph, Annotation, MemorySaver, Command, interrupt } from "@langchain/langgraph";
+import { randomUUID } from "node:crypto";
 import {
   HumanMessage,
   AIMessage,
@@ -9,6 +10,7 @@ import {
 import type { DbClient } from "@agents/db";
 import type { UserToolSetting, UserIntegration } from "@agents/types";
 import { createChatModel } from "./model";
+import { runCompactionNode } from "./nodes/compaction-node";
 import {
   buildLangChainTools,
   buildPendingToolReview,
@@ -33,6 +35,14 @@ const GraphState = Annotation.Root({
     reducer: (prev, next) => [...new Set([...prev, ...next])],
     default: () => [],
   }),
+  compactionCount: Annotation<number>({
+    reducer: (_prev, next) => next,
+    default: () => 0,
+  }),
+  compactionFailureCount: Annotation<number>({
+    reducer: (_prev, next) => next,
+    default: () => 0,
+  }),
 });
 
 const sharedCheckpointer = new MemorySaver();
@@ -46,6 +56,7 @@ export interface AgentInput {
   message: string;
   userId: string;
   sessionId: string;
+  checkpointThreadId?: string;
   systemPrompt: string;
   db: DbClient;
   enabledTools: UserToolSetting[];
@@ -152,7 +163,8 @@ function getInterruptedReviewFromSnapshot(
 
 async function persistPendingConfirmation(
   input: AgentInput,
-  review: PendingToolReview
+  review: PendingToolReview,
+  checkpointThreadId: string
 ): Promise<PendingConfirmation> {
   const pendingConfirmation = await createPendingToolCallRecord(
     {
@@ -163,7 +175,8 @@ async function persistPendingConfirmation(
       integrations: input.integrations,
       integrationSecrets: input.integrationSecrets,
     },
-    review
+    review,
+    checkpointThreadId
   );
 
   await addMessage(input.db, input.sessionId, "assistant", pendingConfirmation.message, {
@@ -187,17 +200,28 @@ function getResponseText(lastMessage: BaseMessage): string {
 
 async function invokeGraph(
   input: AgentInput,
-  invocationInput: { messages: BaseMessage[]; sessionId: string; userId: string; systemPrompt: string; processedToolCallIds: string[] } | Command
+  invocationInput:
+    | {
+        messages: BaseMessage[];
+        sessionId: string;
+        userId: string;
+        systemPrompt: string;
+        processedToolCallIds: string[];
+        compactionCount: number;
+        compactionFailureCount: number;
+      }
+    | Command
 ): Promise<AgentOutput> {
   const {
     db,
     userId,
     sessionId,
-    systemPrompt,
     enabledTools,
     integrations,
     integrationSecrets,
   } = input;
+  const checkpointThreadId =
+    input.checkpointThreadId?.trim() || `${sessionId}:${randomUUID()}`;
 
   const model = createChatModel();
   const lcTools = buildLangChainTools({
@@ -217,6 +241,17 @@ async function invokeGraph(
   ): Promise<Partial<typeof GraphState.State>> {
     const response = await modelWithTools.invoke(state.messages);
     return { messages: [response] };
+  }
+
+  async function compactionNode(
+    state: typeof GraphState.State
+  ): Promise<Partial<typeof GraphState.State>> {
+    return runCompactionNode({
+      messages: state.messages,
+      sessionId: state.sessionId,
+      compactionCount: state.compactionCount,
+      compactionFailureCount: state.compactionFailureCount,
+    });
   }
 
   async function toolExecutorNode(
@@ -314,34 +349,40 @@ async function invokeGraph(
   }
 
   function afterTools(state: typeof GraphState.State): string {
-    return getNextToolCall(state) ? "tools" : "agent";
+    return getNextToolCall(state) ? "tools" : "compaction";
   }
 
   const graph = new StateGraph(GraphState)
+    .addNode("compaction", compactionNode)
     .addNode("agent", agentNode)
     .addNode("tools", toolExecutorNode)
-    .addEdge("__start__", "agent")
+    .addEdge("__start__", "compaction")
+    .addEdge("compaction", "agent")
     .addConditionalEdges("agent", shouldContinue, {
       tools: "tools",
       end: "__end__",
     })
     .addConditionalEdges("tools", afterTools, {
       tools: "tools",
-      agent: "agent",
+      compaction: "compaction",
     });
 
   const app = graph.compile({ checkpointer: sharedCheckpointer });
   const finalState = await app.invoke(invocationInput, {
-    configurable: { thread_id: sessionId },
+    configurable: { thread_id: checkpointThreadId },
   });
   const snapshot = await app.getState({
-    configurable: { thread_id: sessionId },
+    configurable: { thread_id: checkpointThreadId },
   });
 
   const interruptedReview =
     getInterruptedReviewFromSnapshot(snapshot) ?? getInterruptedReview(finalState);
   if (interruptedReview) {
-    const pendingConfirmation = await persistPendingConfirmation(input, interruptedReview);
+    const pendingConfirmation = await persistPendingConfirmation(
+      input,
+      interruptedReview,
+      checkpointThreadId
+    );
     return {
       response: null,
       toolCalls: toolCallNames,
@@ -384,6 +425,8 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     userId: input.userId,
     systemPrompt: input.systemPrompt,
     processedToolCallIds: [],
+    compactionCount: 0,
+    compactionFailureCount: 0,
   });
 }
 

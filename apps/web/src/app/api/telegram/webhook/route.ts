@@ -49,6 +49,11 @@ interface TelegramUpdate {
   };
 }
 
+function getCheckpointThreadId(args: Record<string, unknown> | null | undefined): string | undefined {
+  const value = args?.__checkpoint_thread_id;
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
 
 /** Telegram sends "/cmd@BotName args" when the user picks a command from the menu. */
 function parseBotCommand(messageText: string): { command: string; args: string } {
@@ -184,6 +189,7 @@ export async function POST(request: Request) {
             db,
             userId: telegramAccount.user_id,
             sessionId: approvedToolCall.session_id,
+            checkpointThreadId: getCheckpointThreadId(approvedToolCall.arguments_json),
             systemPrompt: runtime.systemPrompt,
             enabledTools: runtime.enabledTools,
             integrations: runtime.integrations,
@@ -223,6 +229,7 @@ export async function POST(request: Request) {
             db,
             userId: telegramAccount.user_id,
             sessionId: rejectedToolCall.session_id,
+            checkpointThreadId: getCheckpointThreadId(rejectedToolCall.arguments_json),
             systemPrompt: runtime.systemPrompt,
             enabledTools: runtime.enabledTools,
             integrations: runtime.integrations,

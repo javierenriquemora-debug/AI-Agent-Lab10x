@@ -38,6 +38,8 @@ export interface AgentSession {
   status: "active" | "closed";
   budget_tokens_used: number;
   budget_tokens_limit: number;
+  memory_flushed_at?: string | null;
+  memory_last_processed_message_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -125,4 +127,20 @@ export interface ScheduledTaskRun {
   agent_session_id: string | null;
   response_excerpt: string | null;
   triggered_by: "cron" | "manual";
+}
+
+export type MemoryType = "episodic" | "semantic" | "procedural";
+
+export interface MemoryRecord {
+  id: string;
+  user_id: string;
+  type: MemoryType;
+  content: string;
+  retrieval_count: number;
+  last_retrieved_at: string | null;
+  source_session_id: string | null;
+  source_message_start_at: string | null;
+  source_message_end_at: string | null;
+  dedupe_hash: string;
+  created_at: string;
 }

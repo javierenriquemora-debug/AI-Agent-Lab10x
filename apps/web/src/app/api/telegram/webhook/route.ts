@@ -7,6 +7,11 @@ import {
 } from "@agents/db";
 import { resumeAgent, runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
+import {
+  closeSessionWithMemoryFlush,
+  closeActiveSessionsWithMemoryFlush,
+  getOrCreateSessionWithMemoryFlush,
+} from "@/lib/session-memory";
 import { sendTelegramMessage } from "@/lib/telegram-bot";
 import {
   injectBashContinuation,
@@ -19,6 +24,7 @@ import {
   rejectAllPendingConfirmations,
   resolveDateReferences,
   REJECTION_RE,
+  SESSION_CLOSE_RE,
 } from "@/lib/message-preprocessing";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
@@ -52,6 +58,12 @@ interface TelegramUpdate {
 function getCheckpointThreadId(args: Record<string, unknown> | null | undefined): string | undefined {
   const value = args?.__checkpoint_thread_id;
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function normalizeAgentResponse(response: string | null | undefined, fallback: string): string {
+  return typeof response === "string" && response.trim().length > 0
+    ? response.trim()
+    : fallback;
 }
 
 
@@ -205,8 +217,17 @@ export async function POST(request: Request) {
               { text: "Cancelar", callback_data: `reject:${result.pendingConfirmation.toolCallId}` },
             ]],
           });
-        } else if (result.response) {
-          await sendTelegramMessage(cb.message.chat.id, result.response);
+        } else {
+          if (approvedToolCall.tool_name === "calendar_create_event") {
+            await closeSessionWithMemoryFlush(db, approvedToolCall.session_id);
+          }
+          await sendTelegramMessage(
+            cb.message.chat.id,
+            normalizeAgentResponse(
+              result.response,
+              "La acción se procesó, pero no devolvió una respuesta visible."
+            )
+          );
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : "No se pudo ejecutar la acción.";
@@ -246,7 +267,10 @@ export async function POST(request: Request) {
             ]],
           });
         } else {
-          await sendTelegramMessage(cb.message.chat.id, result.response ?? "Acción cancelada.");
+          await sendTelegramMessage(
+            cb.message.chat.id,
+            normalizeAgentResponse(result.response, "Acción cancelada.")
+          );
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : "No se pudo procesar la acción.";
@@ -357,32 +381,7 @@ export async function POST(request: Request) {
 
   const userId = telegramAccount.user_id;
 
-  // Get or create session
-  let session = await db
-    .from("agent_sessions")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("channel", "telegram")
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
-    .then((r) => r.data);
-
-  if (!session) {
-    const { data } = await db
-      .from("agent_sessions")
-      .insert({
-        user_id: userId,
-        channel: "telegram",
-        status: "active",
-        budget_tokens_used: 0,
-        budget_tokens_limit: 100000,
-      })
-      .select()
-      .single();
-    session = data;
-  }
+  const session = await getOrCreateSessionWithMemoryFlush(db, userId, "telegram");
 
   if (!session) {
     await sendTelegramMessage(chatId, "Error interno creando sesión.");
@@ -411,16 +410,20 @@ export async function POST(request: Request) {
     const wasSchedulingProposal = SCHEDULING_PROPOSAL_RE.test(lastContent);
 
     if (cancelled > 0 || wasSchedulingProposal) {
-      await db
-        .from("agent_sessions")
-        .update({ status: "closed" })
-        .eq("user_id", telegramAccount.user_id)
-        .eq("channel", "telegram")
-        .eq("status", "active");
+      await closeActiveSessionsWithMemoryFlush(db, telegramAccount.user_id, "telegram");
       const reply = "Entendido, ¿en qué más puedo ayudarte?";
       await sendTelegramMessage(chatId, reply);
       return NextResponse.json({ ok: true });
     }
+  }
+
+  if (SESSION_CLOSE_RE.test(text.trim())) {
+    await closeActiveSessionsWithMemoryFlush(db, telegramAccount.user_id, "telegram");
+    await sendTelegramMessage(
+      chatId,
+      "Entendido, cierro esta conversación por ahora. Cuando quieras seguimos."
+    );
+    return NextResponse.json({ ok: true });
   }
 
   const runtime = await loadAgentRuntimeContext(db, userId);

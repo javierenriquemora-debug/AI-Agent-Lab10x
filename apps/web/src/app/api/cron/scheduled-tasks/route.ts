@@ -15,6 +15,7 @@ import { runAgent } from "@agents/agent";
 import type { ScheduledTask } from "@agents/types";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
 import { buildScheduledExecutionMessage } from "@/lib/message-preprocessing";
+import { closeSessionWithMemoryFlush } from "@/lib/session-memory";
 import { sendTelegramMessage } from "@/lib/telegram-bot";
 
 const CRON_SECRET = process.env.SCHEDULED_TASKS_CRON_SECRET ?? "";
@@ -110,10 +111,7 @@ async function dispatchScheduledTask(
       : undefined;
 
     await sendTelegramMessage(telegramAccount.chat_id, responseText, replyMarkup);
-    await db
-      .from("agent_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
+    await closeSessionWithMemoryFlush(db, session.id);
 
     const nextRunAt = computeFollowingRun(claimedTask);
     await markScheduledTaskRunSucceeded(db, run.id, {
@@ -143,10 +141,7 @@ async function dispatchScheduledTask(
     });
 
     if (agentSessionId) {
-      await db
-        .from("agent_sessions")
-        .update({ status: "closed", updated_at: new Date().toISOString() })
-        .eq("id", agentSessionId);
+      await closeSessionWithMemoryFlush(db, agentSessionId);
     }
 
     await markScheduledTaskRunFailed(db, run.id, {

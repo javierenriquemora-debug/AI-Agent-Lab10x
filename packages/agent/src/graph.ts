@@ -10,6 +10,7 @@ import {
 import type { DbClient } from "@agents/db";
 import type { UserToolSetting, UserIntegration } from "@agents/types";
 import { createChatModel } from "./model";
+import { augmentSystemPromptWithMemories } from "./memory-retrieval";
 import { runCompactionNode } from "./nodes/compaction-node";
 import {
   buildLangChainTools,
@@ -403,6 +404,12 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     systemPrompt,
     db,
   } = input;
+  const effectiveSystemPrompt = await augmentSystemPromptWithMemories({
+    db,
+    userId: input.userId,
+    userInput: message,
+    baseSystemPrompt: systemPrompt,
+  });
 
   const history = await getSessionMessages(db, sessionId, 30);
   const priorMessages: BaseMessage[] = history.map((m) => {
@@ -414,7 +421,7 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
   await addMessage(db, sessionId, "user", message);
 
   const initialMessages: BaseMessage[] = [
-    new SystemMessage(systemPrompt),
+    new SystemMessage(effectiveSystemPrompt),
     ...priorMessages,
     new HumanMessage(message),
   ];
@@ -423,7 +430,7 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     messages: initialMessages,
     sessionId: input.sessionId,
     userId: input.userId,
-    systemPrompt: input.systemPrompt,
+    systemPrompt: effectiveSystemPrompt,
     processedToolCallIds: [],
     compactionCount: 0,
     compactionFailureCount: 0,

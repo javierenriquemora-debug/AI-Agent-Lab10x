@@ -81,3 +81,33 @@ export function createCompactionModel() {
     return createChatModel();
   }
 }
+
+export function createMemoryFlushModel() {
+  const provider = normalizeProvider(
+    process.env.MEMORY_FLUSH_LLM_PROVIDER ??
+      process.env.COMPACTION_LLM_PROVIDER ??
+      process.env.LLM_PROVIDER
+  );
+
+  try {
+    if (provider === "gemini") {
+      return createGeminiModel(
+        process.env.GEMINI_MEMORY_FLUSH_MODEL ??
+          process.env.GEMINI_COMPACTION_MODEL ??
+          process.env.GEMINI_MODEL ??
+          "gemini-2.5-flash",
+        0.1
+      );
+    }
+
+    return createOpenRouterModel(
+      process.env.OPENROUTER_MEMORY_FLUSH_MODEL ??
+        process.env.OPENROUTER_COMPACTION_MODEL ??
+        process.env.OPENROUTER_MODEL ??
+        "openai/gpt-4o-mini",
+      0.1
+    );
+  } catch {
+    return createCompactionModel();
+  }
+}

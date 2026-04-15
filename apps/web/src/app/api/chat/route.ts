@@ -1,8 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { createServerClient, getOrCreateSession } from "@agents/db";
+import { createServerClient } from "@agents/db";
 import { runAgent } from "@agents/agent";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
+import {
+  closeActiveSessionsWithMemoryFlush,
+  getOrCreateSessionWithMemoryFlush,
+} from "@/lib/session-memory";
 import {
   injectBashContinuation,
   injectFileContinuation,
@@ -14,6 +18,7 @@ import {
   rejectAllPendingConfirmations,
   resolveDateReferences,
   REJECTION_RE,
+  SESSION_CLOSE_RE,
 } from "@/lib/message-preprocessing";
 
 export async function POST(request: Request) {
@@ -34,7 +39,7 @@ export async function POST(request: Request) {
 
     // Use the service-role db client for all session operations so they always
     // succeed regardless of user-auth token state or RLS edge cases.
-    const session = await getOrCreateSession(db, user.id, "web");
+    const session = await getOrCreateSessionWithMemoryFlush(db, user.id, "web");
     if (!session) {
       return NextResponse.json({ error: "Failed to create session" }, { status: 500 });
     }
@@ -61,15 +66,15 @@ export async function POST(request: Request) {
       const wasSchedulingProposal = SCHEDULING_PROPOSAL_RE.test(lastContent);
 
       if (cancelled > 0 || wasSchedulingProposal) {
-        await db
-          .from("agent_sessions")
-          .update({ status: "closed" })
-          .eq("user_id", user.id)
-          .eq("channel", "web")
-          .eq("status", "active");
+        await closeActiveSessionsWithMemoryFlush(db, user.id, "web");
         const reply = "Entendido, ¿en qué más puedo ayudarte?";
         return NextResponse.json({ response: reply });
       }
+    }
+
+    if (SESSION_CLOSE_RE.test(message.trim())) {
+      await closeActiveSessionsWithMemoryFlush(db, user.id, "web");
+      return NextResponse.json({ response: "Entendido, cierro esta conversación por ahora. Cuando quieras seguimos." });
     }
 
     // Preprocessing pipeline (order matters):

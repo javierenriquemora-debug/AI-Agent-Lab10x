@@ -9,6 +9,10 @@ import {
 import { resumeAgent } from "@agents/agent";
 import { createClient } from "@/lib/supabase/server";
 import { loadAgentRuntimeContext } from "@/lib/agent-runtime";
+import {
+  closeActiveSessionsWithMemoryFlush,
+  closeSessionWithMemoryFlush,
+} from "@/lib/session-memory";
 
 interface RequestBody {
   action?: "approve" | "reject";
@@ -80,12 +84,7 @@ export async function POST(
       );
 
       if (toolCall.tool_name === "calendar_create_event") {
-        await db
-          .from("agent_sessions")
-          .update({ status: "closed" })
-          .eq("user_id", user.id)
-          .eq("channel", "web")
-          .eq("status", "active");
+        await closeActiveSessionsWithMemoryFlush(db, user.id, "web");
       }
 
       return NextResponse.json({
@@ -121,6 +120,9 @@ export async function POST(
       },
       { type: "approve", toolCallId }
     );
+    if (toolCall.tool_name === "calendar_create_event" && !result.pendingConfirmation) {
+      await closeSessionWithMemoryFlush(db, approvedToolCall.session_id);
+    }
     return NextResponse.json({
       ok: true,
       message: result.response,

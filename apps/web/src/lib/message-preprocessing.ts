@@ -76,6 +76,13 @@ const CONTACT_SELECTION_REPLY_RE =
 export const REJECTION_RE =
   /^(no|nop|nope|nel)$|no\s+(quiero|proceder|crear|agendar|gracias)|cancelar?|cancela(r|do)?|olvida(r|lo)?|d[eé]jalo|no\s+lo\s+hagas|no\s+proceed/i;
 
+/**
+ * Detects explicit, natural-language intent to end the current conversation
+ * without relying on ambiguous courtesy-only replies like "gracias" or "listo".
+ */
+export const SESSION_CLOSE_RE =
+  /\b(dej[eé]moslo\s+hasta\s+aqu[ií]|por\s+ahora\s+dej[eé]moslo\s+as[ií]|con\s+esto\s+terminamos|eso\s+es\s+todo\s+por\s+ahora|hasta\s+aqu[ií]\s+llegamos|terminemos\s+aqu[ií]|cerramos\s+por\s+ahora|lo\s+dejamos\s+hasta\s+aqu[ií]|no\s+necesito\s+nada\s+m[aá]s\s+por\s+ahora|con\s+eso\s+basta\s+por\s+ahora|listo,\s*paramos\s+aqu[ií]|ok,\s*dej[eé]moslo\s+ah[ií]|bueno,\s*con\s+eso\s+quedamos|vale,\s*hasta\s+aqu[ií]|perfecto,\s*lo\s+dejamos\s+as[ií]\s+por\s+ahora)\b/i;
+
 function hasSchedulingCreationIntent(text: string): boolean {
   return SCHEDULE_INTENT_RE.test(text) && !AGENDA_QUERY_RE.test(text);
 }

@@ -1,0 +1,28 @@
+---
+description: Ask about selective long-term memory when services change
+alwaysApply: true
+---
+
+# Selective Memory Service Check
+
+When creating a new service, modifying an existing service, adding a tool, changing intent detection, or changing user-facing formatting/preferences, explicitly evaluate selective long-term memory impact before coding.
+
+Ask the user these questions whenever the impact is non-trivial or ambiguous:
+
+1. Should this service use selective long-term memory at all?
+2. If yes, what should be stored as durable memory?
+3. What should never be stored because it is ephemeral, sensitive, tool-derived, or better fetched live?
+4. Should any remembered pattern be `suggest_only` instead of `remember`?
+5. Are there preference phrases like "cuando me muestres..." that must be treated as future preference instead of immediate execution?
+6. Should this service stay isolated from other scopes, or share only with `general`?
+
+If the user decides "do not store anything" for that service, respect it and avoid adding memory rules for it.
+
+Before finishing, confirm whether the change requires touching:
+
+- `packages/agent/src/memory-policy.ts`
+- `packages/agent/src/memory-flush.ts`
+- `packages/agent/src/memory-retrieval.ts`
+- `apps/web/src/lib/message-preprocessing.ts`
+
+If relevant, propose a minimal validation set: preference message, session close/flush, later retrieval, and cross-service isolation.

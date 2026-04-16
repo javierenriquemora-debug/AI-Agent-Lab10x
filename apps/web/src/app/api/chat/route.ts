@@ -8,6 +8,7 @@ import {
   getOrCreateSessionWithMemoryFlush,
 } from "@/lib/session-memory";
 import {
+  injectAgendaPreferenceDirective,
   injectBashContinuation,
   injectFileContinuation,
   injectScheduledTaskReferenceContinuation,
@@ -83,7 +84,8 @@ export async function POST(request: Request) {
     //    skip date-context and directive injection to avoid double directives.
     // 3. Only when NOT in an active scheduling flow: inject date context (for
     //    availability follow-ups) and the first-message scheduling directive.
-    let processedMessage = resolveDateReferences(message, runtime.timezone);
+    let processedMessage = injectAgendaPreferenceDirective(message);
+    processedMessage = resolveDateReferences(processedMessage, runtime.timezone);
     const afterContinuation = await injectSchedulingContinuation(db, session.id, processedMessage);
     if (afterContinuation !== processedMessage) {
       // Active scheduling flow — continuation directive takes precedence

@@ -33,6 +33,8 @@ export const SCHEDULE_INTENT_RE =
   /\b(agenda|agendar|programa|programar|crea(r)?\s+(un\s+)?(evento|reuni[oó]n|espacio|cita)|reuni[oó]n|meeting)\b/i;
 export const AGENDA_QUERY_RE =
   /\b(c[oó]mo\s+estoy\s+de\s+agenda|mi\s+agenda|qu[eé]\s+tengo\s+en\s+la\s+agenda|qu[eé]\s+tengo\s+ma[ñn]ana|revis[ae]\s+mi\s+agenda|m[ué]strame\s+mi\s+agenda|disponibilidad|espacios\s+disponibles|eventos?\s+de)\b/i;
+export const AGENDA_PREFERENCE_RE =
+  /\b(cuando\s+me\s+m[ué]estres\s+mi\s+agenda|cuando\s+me\s+m[ué]estres\s+la\s+agenda|cuando\s+listes\s+mi\s+agenda|prefiero\s+que\s+al\s+mostrar(?:me)?\s+mi\s+agenda|quiero\s+que\s+al\s+mostrar(?:me)?\s+mi\s+agenda)\b/i;
 
 export const HOUR_REF_RE =
   /\b(a las\s+\d|am\b|pm\b|\d{1,2}:\d{2}|\d{1,2}\s*(am|pm))/i;
@@ -81,7 +83,7 @@ export const REJECTION_RE =
  * without relying on ambiguous courtesy-only replies like "gracias" or "listo".
  */
 export const SESSION_CLOSE_RE =
-  /\b(dej[eé]moslo\s+hasta\s+aqu[ií]|por\s+ahora\s+dej[eé]moslo\s+as[ií]|con\s+esto\s+terminamos|eso\s+es\s+todo\s+por\s+ahora|hasta\s+aqu[ií]\s+llegamos|terminemos\s+aqu[ií]|cerramos\s+por\s+ahora|lo\s+dejamos\s+hasta\s+aqu[ií]|no\s+necesito\s+nada\s+m[aá]s\s+por\s+ahora|con\s+eso\s+basta\s+por\s+ahora|listo,\s*paramos\s+aqu[ií]|ok,\s*dej[eé]moslo\s+ah[ií]|bueno,\s*con\s+eso\s+quedamos|vale,\s*hasta\s+aqu[ií]|perfecto,\s*lo\s+dejamos\s+as[ií]\s+por\s+ahora)\b/i;
+  /^\s*(?:dej[eé]moslo\s+hasta\s+aqu[ií]|por\s+ahora\s+dej[eé]moslo\s+as[ií]|dej[eé]moslo\s+as[ií]\s+por\s+ahora|dej[eé]mos\s+esto\s+as[ií]\s+por\s+ahora|lo\s+dejamos\s+as[ií]\s+por\s+ahora|con\s+esto\s+terminamos|eso\s+es\s+todo\s+por\s+ahora|hasta\s+aqu[ií]\s+llegamos|terminemos\s+aqu[ií]|cerramos\s+por\s+ahora|lo\s+dejamos\s+hasta\s+aqu[ií]|no\s+necesito\s+nada\s+m[aá]s\s+por\s+ahora|con\s+eso\s+basta\s+por\s+ahora|listo,\s*paramos\s+aqu[ií]|ok,\s*dej[eé]moslo\s+ah[ií]|bueno,\s*con\s+eso\s+quedamos|vale,\s*hasta\s+aqu[ií]|perfecto,\s*lo\s+dejamos\s+as[ií]\s+por\s+ahora)[.!?,;:\s]*$/i;
 
 function hasSchedulingCreationIntent(text: string): boolean {
   return SCHEDULE_INTENT_RE.test(text) && !AGENDA_QUERY_RE.test(text);
@@ -476,6 +478,16 @@ export async function injectScheduledTaskReferenceContinuation(
     `de la última lista mostrada. Esa tarea corresponde a task_id="${selectedTask.id}". ` +
     `El usuario quiere cancelarla o desprogramarla. ` +
     `Llama cancel_scheduled_task con task_id="${selectedTask.id}" sin pedir el UUID nuevamente.]\n\n${text}`
+  );
+}
+
+export function injectAgendaPreferenceDirective(text: string): string {
+  if (!AGENDA_PREFERENCE_RE.test(text)) return text;
+
+  return (
+    `[PREFERENCIA DE FORMATO DE AGENDA. El usuario está definiendo cómo quiere que se muestre su agenda en el futuro. ` +
+    `NO llames tools de calendario en este turno. ` +
+    `Reconoce la preferencia, confirma que la aplicarás en futuras consultas de agenda y NO listes eventos ahora.]\n\n${text}`
   );
 }
 

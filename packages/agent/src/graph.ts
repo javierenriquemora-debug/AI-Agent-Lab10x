@@ -11,6 +11,7 @@ import type { DbClient } from "@agents/db";
 import type { UserToolSetting, UserIntegration } from "@agents/types";
 import { createChatModel } from "./model";
 import { augmentSystemPromptWithMemories } from "./memory-retrieval";
+import { detectMemoryServiceScope } from "./memory-policy";
 import { runCompactionNode } from "./nodes/compaction-node";
 import {
   buildLangChainTools,
@@ -404,11 +405,13 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     systemPrompt,
     db,
   } = input;
+  const memoryScope = detectMemoryServiceScope({ text: message });
   const effectiveSystemPrompt = await augmentSystemPromptWithMemories({
     db,
     userId: input.userId,
     userInput: message,
     baseSystemPrompt: systemPrompt,
+    scope: memoryScope,
   });
 
   const history = await getSessionMessages(db, sessionId, 30);

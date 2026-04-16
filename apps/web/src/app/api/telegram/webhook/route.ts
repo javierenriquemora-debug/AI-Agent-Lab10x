@@ -14,6 +14,7 @@ import {
 } from "@/lib/session-memory";
 import { sendTelegramMessage } from "@/lib/telegram-bot";
 import {
+  injectAgendaPreferenceDirective,
   injectBashContinuation,
   injectFileContinuation,
   injectScheduledTaskReferenceContinuation,
@@ -55,6 +56,14 @@ interface TelegramUpdate {
   };
 }
 
+interface TelegramAccountRow {
+  id: string;
+  user_id: string;
+  telegram_user_id: number;
+  chat_id: number;
+  linked_at: string;
+}
+
 function getCheckpointThreadId(args: Record<string, unknown> | null | undefined): string | undefined {
   const value = args?.__checkpoint_thread_id;
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
@@ -64,6 +73,122 @@ function normalizeAgentResponse(response: string | null | undefined, fallback: s
   return typeof response === "string" && response.trim().length > 0
     ? response.trim()
     : fallback;
+}
+
+async function resolveTelegramAccount(
+  db: ReturnType<typeof createServerClient>,
+  args: {
+    telegramUserId: number;
+    chatId: number;
+    source: "message" | "callback";
+  }
+): Promise<TelegramAccountRow | null> {
+  const byTelegramId = await db
+    .from("telegram_accounts")
+    .select("*")
+    .eq("telegram_user_id", args.telegramUserId)
+    .maybeSingle();
+
+  if (byTelegramId.error) {
+    console.warn("Telegram account lookup by telegram_user_id failed.", {
+      source: args.source,
+      telegramUserId: args.telegramUserId,
+      chatId: args.chatId,
+      error: byTelegramId.error.message,
+    });
+  }
+
+  if (byTelegramId.data) {
+    const account = byTelegramId.data as TelegramAccountRow;
+    if (account.chat_id !== args.chatId) {
+      const { error: syncError } = await db
+        .from("telegram_accounts")
+        .update({
+          chat_id: args.chatId,
+          linked_at: new Date().toISOString(),
+        })
+        .eq("id", account.id);
+      if (syncError) {
+        console.warn("Telegram account chat_id sync failed.", {
+          source: args.source,
+          telegramUserId: args.telegramUserId,
+          chatId: args.chatId,
+          accountId: account.id,
+          error: syncError.message,
+        });
+      }
+      return {
+        ...account,
+        chat_id: args.chatId,
+      };
+    }
+    return account;
+  }
+
+  console.warn("Telegram account not found by telegram_user_id; trying fallback by chat_id.", {
+    source: args.source,
+    telegramUserId: args.telegramUserId,
+    chatId: args.chatId,
+  });
+
+  const byChatId = await db
+    .from("telegram_accounts")
+    .select("*")
+    .eq("chat_id", args.chatId)
+    .maybeSingle();
+
+  if (byChatId.error) {
+    console.warn("Telegram account lookup by chat_id failed.", {
+      source: args.source,
+      telegramUserId: args.telegramUserId,
+      chatId: args.chatId,
+      error: byChatId.error.message,
+    });
+    return null;
+  }
+
+  if (!byChatId.data) {
+    console.warn("Telegram account fallback by chat_id also failed.", {
+      source: args.source,
+      telegramUserId: args.telegramUserId,
+      chatId: args.chatId,
+    });
+    return null;
+  }
+
+  const fallbackAccount = byChatId.data as TelegramAccountRow;
+  const { error: repairError } = await db
+    .from("telegram_accounts")
+    .update({
+      telegram_user_id: args.telegramUserId,
+      chat_id: args.chatId,
+      linked_at: new Date().toISOString(),
+    })
+    .eq("id", fallbackAccount.id);
+
+  if (repairError) {
+    console.warn("Telegram account fallback resolved but repair failed.", {
+      source: args.source,
+      telegramUserId: args.telegramUserId,
+      chatId: args.chatId,
+      accountId: fallbackAccount.id,
+      error: repairError.message,
+    });
+  } else {
+    console.warn("Telegram account fallback by chat_id succeeded and repaired linkage.", {
+      source: args.source,
+      telegramUserId: args.telegramUserId,
+      chatId: args.chatId,
+      accountId: fallbackAccount.id,
+      userId: fallbackAccount.user_id,
+    });
+  }
+
+  return {
+    ...fallbackAccount,
+    telegram_user_id: args.telegramUserId,
+    chat_id: args.chatId,
+  };
 }
 
 
@@ -166,12 +291,11 @@ export async function POST(request: Request) {
   if (update.callback_query) {
     const cb = update.callback_query;
     const [action, toolCallId] = cb.data.split(":");
-
-    const { data: telegramAccount } = await db
-      .from("telegram_accounts")
-      .select("*")
-      .eq("telegram_user_id", cb.from.id)
-      .single();
+    const telegramAccount = await resolveTelegramAccount(db, {
+      telegramUserId: cb.from.id,
+      chatId: cb.message.chat.id,
+      source: "callback",
+    });
 
     if (!telegramAccount) {
       await answerCallbackQuery(cb.id, "No autorizado");
@@ -365,11 +489,11 @@ export async function POST(request: Request) {
   }
 
   // Resolve user from telegram_user_id
-  const { data: telegramAccount } = await db
-    .from("telegram_accounts")
-    .select("*")
-    .eq("telegram_user_id", telegramUserId)
-    .single();
+  const telegramAccount = await resolveTelegramAccount(db, {
+    telegramUserId,
+    chatId,
+    source: "message",
+  });
 
   if (!telegramAccount) {
     await sendTelegramMessage(
@@ -434,6 +558,7 @@ export async function POST(request: Request) {
   //    skip date-context and directive injection to avoid double directives.
   // 3. Only when NOT in an active scheduling flow: inject date context (for
   //    availability follow-ups) and the first-message scheduling directive.
+  text = injectAgendaPreferenceDirective(text);
   text = resolveDateReferences(text, runtime.timezone);
   const afterContinuation = await injectSchedulingContinuation(db, session.id, text);
   if (afterContinuation !== text) {

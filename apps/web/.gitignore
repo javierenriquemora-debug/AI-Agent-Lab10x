@@ -45,3 +45,7 @@ next-env.d.ts
 
 # Cursor metadata (local only)
 .cursor/
+
+# Sentry wizard examples (not needed for prod)
+src/app/api/sentry-example-api/
+src/app/sentry-example-page/

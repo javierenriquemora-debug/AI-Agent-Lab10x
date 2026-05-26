@@ -13,6 +13,8 @@
     "@agents/agent": "*",
     "@agents/db": "*",
     "@agents/types": "*",
+    "@langfuse/otel": "^5.2.0",
+    "@opentelemetry/sdk-node": "^0.208.0",
     "@sentry/nextjs": "^10.49.0",
     "@supabase/ssr": "^0.5",
     "@supabase/supabase-js": "^2",

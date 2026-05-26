@@ -14,7 +14,16 @@ const allowedDevOrigins = [
 
 const nextConfig: NextConfig = {
   transpilePackages: ["@agents/agent", "@agents/db", "@agents/types"],
-  serverExternalPackages: ["@langchain/core", "@langchain/langgraph", "@langchain/openai"],
+  serverExternalPackages: [
+    "@langchain/core",
+    "@langchain/langgraph",
+    "@langchain/openai",
+    "@opentelemetry/sdk-node",
+    "@opentelemetry/api",
+    "@langfuse/otel",
+    "@langfuse/tracing",
+    "@langfuse/core",
+  ],
   allowedDevOrigins,
 };
 

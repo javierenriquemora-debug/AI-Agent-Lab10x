@@ -24,6 +24,10 @@ import {
 } from "./tools/adapters";
 import { getSessionMessages, addMessage } from "@agents/db";
 import { toolRequiresConfirmation } from "./tools/catalog";
+import {
+  createLangfuseCallbackHandler,
+  flushLangfuseTracing,
+} from "./langfuse-graph";
 
 const GraphState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -370,9 +374,19 @@ async function invokeGraph(
     });
 
   const app = graph.compile({ checkpointer: sharedCheckpointer });
-  const finalState = await app.invoke(invocationInput, {
-    configurable: { thread_id: checkpointThreadId },
-  });
+  const langfuseHandler = createLangfuseCallbackHandler({ userId, sessionId });
+
+  let finalState: typeof GraphState.State;
+  try {
+    finalState = await app.invoke(invocationInput, {
+      configurable: { thread_id: checkpointThreadId },
+      ...(langfuseHandler
+        ? { callbacks: [langfuseHandler] }
+        : {}),
+    });
+  } finally {
+    await flushLangfuseTracing();
+  }
   const snapshot = await app.getState({
     configurable: { thread_id: checkpointThreadId },
   });
